@@ -1,0 +1,150 @@
+# Cowart
+
+Cowart 是一个面向 Codex 的本地无限画布插件。它基于 tldraw 提供可视化画布，用于构思、标注、生成图片和根据标注图迭代图片。画布运行在本地网页服务中，数据默认保存到当前用户项目的 `canvas/` 目录，而不是保存到插件仓库里。
+
+English README: [README.en.md](README.en.md)
+
+## 功能
+
+- 在 Codex 中打开一个本地 tldraw 无限画布。
+- 在当前项目目录中持久化画布页面和图片资源。
+- 在画布中创建 AI image holder，并让 Codex 生成图片填入选中的 holder。
+- 上传或提供 Cowart 标注截图，让 Codex 根据标注生成干净的新图并放到原图旁边。
+- 通过 Cowart MCP 工具读取选择状态、插入图片，并保存到页面本地资源目录。
+
+## 安装
+
+### 让 Codex 自动安装
+
+把下面这段发给 Codex，并把 `<REPO_URL>` 换成这个仓库的 Git 地址：
+
+```text
+请从 <REPO_URL> 安装 Cowart Codex 插件。
+请 clone 仓库到本地插件目录，确认 .codex-plugin/plugin.json 存在，
+把插件加入 personal marketplace，然后运行 codex plugin add cowart@personal。
+安装后请校验插件，并告诉我是否需要开启一个新对话来加载新技能和 MCP 工具。
+```
+
+### 手动安装
+
+推荐把插件 clone 到 Codex personal marketplace 默认会引用的位置：
+
+```bash
+mkdir -p ~/.agents/plugins/plugins
+git clone <REPO_URL> ~/.agents/plugins/plugins/cowart
+cd ~/.agents/plugins/plugins/cowart
+npm install
+npm run build
+```
+
+确保 `~/.agents/plugins/marketplace.json` 中有 Cowart 条目：
+
+```json
+{
+  "name": "personal",
+  "interface": {
+    "displayName": "Personal"
+  },
+  "plugins": [
+    {
+      "name": "cowart",
+      "source": {
+        "source": "local",
+        "path": "./plugins/cowart"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
+```
+
+然后安装插件：
+
+```bash
+codex plugin add cowart@personal
+```
+
+安装后建议开启一个新的 Codex 对话，让新的 skill 和 MCP 工具完整加载。
+
+## 使用
+
+### 打开画布
+
+在 Codex 中说：
+
+```text
+Open the Cowart canvas for this project.
+```
+
+Cowart 会启动本地服务，默认地址是：
+
+```text
+http://127.0.0.1:43217/
+```
+
+画布数据会保存在当前项目目录下：
+
+```text
+canvas/pages/<page-id>/cowart-canvas.json
+canvas/pages/<page-id>/assets/
+```
+
+### 生成新图
+
+1. 打开 Cowart 画布。
+2. 在画布里创建并选中一个 AI image holder。
+3. 在 Codex 中描述要生成的图片，例如：
+
+```text
+Generate a new image into the selected Cowart AI image holder.
+```
+
+Codex 会读取选中的 holder，按它的比例生成图片，并插入到 holder 中。
+
+### 根据标注图生成新图
+
+1. 在 Cowart 画布中对图片做标注。
+2. 截图并把标注截图发给 Codex。
+3. 使用提示：
+
+```text
+Use my Cowart annotation screenshot to generate a clean revised image beside the original.
+```
+
+Codex 会读取截图里的标注和箭头，生成去掉标注痕迹的新图，并把结果放在原图旁边。原图和标注不会被删除或移动。
+
+## 技能
+
+- `cowart:cowart-open-canvas`：打开 Cowart 本地画布。
+- `cowart:cowart-imgae-gen`：把生成图片插入选中的 AI image holder。
+- `cowart:cowart-image-edit`：根据用户提供的 Cowart 标注截图生成修订图。
+
+## 本地开发
+
+```bash
+npm install
+npm run dev
+npm run build
+```
+
+也可以直接启动画布服务，并指定用户项目目录：
+
+```bash
+./scripts/start-canvas.sh /path/to/user/project
+```
+
+常用环境变量：
+
+- `COWART_PORT`：本地服务端口，默认 `43217`。
+- `COWART_PROJECT_DIR`：画布数据所属的用户项目目录。
+- `COWART_CANVAS_DIR`：画布数据目录，默认是 `$COWART_PROJECT_DIR/canvas`。
+
+## 开发者
+
+ZHONG XIN  
+zhongxin123456@gmail.com  
+https://www.jiqiren.ai
