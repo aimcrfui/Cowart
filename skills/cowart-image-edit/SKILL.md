@@ -1,9 +1,9 @@
 ---
-name: edit-image-from-annotations
+name: cowart-image-edit
 description: Generate new AI images from user-supplied Cowart annotation screenshots. Use when the user provides one or more screenshots showing Cowart images marked with the 批注 tool, arrows, or visible edit notes and wants Codex to apply those requested changes, create revised bitmap images, and place each result beside the corresponding original or in a nearby clear area without replacing, moving, hiding, or deleting the original images or annotations.
 ---
 
-# Edit Image From Annotations
+# Cowart Image Edit
 
 Use this skill to turn user-provided Cowart 批注 screenshots into revised AI-generated bitmaps placed next to the corresponding original images.
 

@@ -1,9 +1,9 @@
 ---
-name: open-cowart-canvas
+name: cowart-open-canvas
 description: Open the Cowart local web service, a tldraw-powered infinite canvas. Use when the user asks to open, launch, view, or work in the Cowart canvas or wants an infinite canvas inside Codex.
 ---
 
-# Open Cowart Canvas
+# Cowart Open Canvas
 
 ## Workflow
 

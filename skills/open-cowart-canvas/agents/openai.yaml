@@ -1,4 +1,0 @@
-interface:
-  display_name: "Open Cowart Canvas"
-  short_description: "Open the Cowart infinite canvas"
-  default_prompt: "Use $open-cowart-canvas to open the Cowart infinite canvas."

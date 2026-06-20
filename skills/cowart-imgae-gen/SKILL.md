@@ -1,9 +1,9 @@
 ---
-name: fill-ai-image-holder
+name: cowart-imgae-gen
 description: Generate a final AI bitmap into the selected Cowart "AI 图片" holder, including any requested in-image text by default. Use when the user asks Codex to create, fill, replace, or place an AI-generated image inside the currently selected AI image placeholder on a Cowart canvas.
 ---
 
-# Fill AI Image Holder
+# Cowart Imgae Gen
 
 Use this skill when the selected Cowart canvas shape is an `AI 图片` holder created by the Cowart toolbar.
 
