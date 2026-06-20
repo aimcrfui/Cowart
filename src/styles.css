@@ -44,3 +44,18 @@ body {
   background: #d1d5db;
   border-radius: 1px;
 }
+
+.cowart-annotation-tool-icon {
+  display: grid;
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  color: currentColor;
+}
+
+.cowart-annotation-tool-icon svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}

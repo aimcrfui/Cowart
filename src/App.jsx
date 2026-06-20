@@ -42,6 +42,7 @@ import {
 import { AllSelection } from '@tiptap/pm/state'
 import 'tldraw/tldraw.css'
 import { useCallback, useEffect, useState } from 'react'
+import annotationToolIconRaw from './assets/tool-comment.svg?raw'
 
 const CANVAS_ENDPOINT = '/api/canvas'
 const CANVAS_EVENTS_ENDPOINT = '/api/canvas-events'
@@ -53,7 +54,7 @@ const AI_IMAGE_HOLDER_LABEL = 'AI 图片'
 const AI_IMAGE_HOLDER_DEFAULT_W = 320
 const AI_IMAGE_HOLDER_DEFAULT_H = 220
 const ANNOTATION_TOOL_ID = 'cowart-annotation'
-const ANNOTATION_TOOL_LABEL = '批注'
+const ANNOTATION_TOOL_LABEL = '标注'
 const ANNOTATION_DEFAULT_COLOR = 'yellow'
 const ANNOTATION_MIN_LENGTH = 8
 const ANNOTATION_BEND_RATIO = 0.12
@@ -62,6 +63,13 @@ const ANNOTATION_MAX_BEND = 48
 const ANNOTATION_LABEL_POSITION = 0
 const ANNOTATION_SELECT_TEXT_MAX_ATTEMPTS = 8
 const ANNOTATION_SELECT_TEXT_SETTLE_ATTEMPTS = 4
+const annotationToolIconSvg = annotationToolIconRaw.replaceAll('black', 'currentColor')
+const annotationToolIcon = (
+  <div
+    className="cowart-annotation-tool-icon"
+    dangerouslySetInnerHTML={{ __html: annotationToolIconSvg }}
+  />
+)
 
 function isCanvasSnapshot(value) {
   return value && typeof value === 'object' && value.store && value.schema
@@ -462,7 +470,7 @@ const cowartUiOverrides = {
       [ANNOTATION_TOOL_ID]: {
         id: ANNOTATION_TOOL_ID,
         label: 'tool.cowart-annotation',
-        icon: 'tool-arrow',
+        icon: annotationToolIcon,
         kbd: 'c',
         onSelect() {
           unlockGlobalToolLock(editor)
