@@ -1,0 +1,7 @@
+interface:
+  display_name: "Fill AI Image Holder"
+  short_description: "Generate an image into a selected Cowart AI holder"
+  default_prompt: "Use $fill-ai-image-holder to generate an image into the selected Cowart AI 图片 holder."
+
+policy:
+  allow_implicit_invocation: true

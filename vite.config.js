@@ -7,6 +7,7 @@ import { basename, dirname, extname, join, relative, resolve, sep } from 'node:p
 const projectDir = resolve(process.env.COWART_PROJECT_DIR ?? process.cwd())
 const canvasDir = resolve(process.env.COWART_CANVAS_DIR ?? join(projectDir, 'canvas'))
 const canvasFile = join(canvasDir, 'cowart-canvas.json')
+const selectionFile = join(canvasDir, 'cowart-selection.json')
 const canvasPagesDir = join(canvasDir, 'pages')
 const canvasAssetsDir = join(canvasDir, 'assets')
 const pagesManifestFile = join(canvasPagesDir, 'manifest.json')
@@ -50,6 +51,10 @@ function readRequestBody(req) {
 
 function isSnapshot(value) {
   return value && typeof value === 'object' && value.store && value.schema
+}
+
+function isSelectionState(value) {
+  return value && typeof value === 'object' && Array.isArray(value.selectedShapes)
 }
 
 function isSafeChildPath(parent, child) {
@@ -415,6 +420,48 @@ function canvasStoragePlugin() {
     name: 'cowart-canvas-storage',
     configureServer(server) {
       server.middlewares.use(serveCanvasAsset)
+
+      server.middlewares.use('/api/selection', async (req, res) => {
+        try {
+          if (req.method === 'GET') {
+            try {
+              sendJson(res, 200, {
+                selection: await readJsonFile(selectionFile),
+                path: selectionFile
+              })
+            } catch (error) {
+              if (error.code === 'ENOENT') {
+                sendJson(res, 200, {
+                  selection: { selectedShapes: [], updatedAt: null },
+                  path: selectionFile
+                })
+                return
+              }
+              throw error
+            }
+            return
+          }
+
+          if (req.method === 'PUT') {
+            const body = await readRequestBody(req)
+            const selection = JSON.parse(body)
+            if (!isSelectionState(selection)) {
+              sendJson(res, 400, { error: 'Expected a Cowart selection state.' })
+              return
+            }
+
+            await writeJsonAtomic(selectionFile, selection)
+            sendJson(res, 200, { ok: true, path: selectionFile })
+            return
+          }
+
+          res.statusCode = 405
+          res.setHeader('allow', 'GET, PUT')
+          res.end()
+        } catch (error) {
+          sendJson(res, 500, { error: error.message })
+        }
+      })
 
       server.middlewares.use('/api/canvas', async (req, res) => {
         try {

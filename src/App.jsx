@@ -1,8 +1,574 @@
-import { Tldraw } from 'tldraw'
+import {
+  ArrowDownToolbarItem,
+  ArrowLeftToolbarItem,
+  ArrowRightToolbarItem,
+  ArrowToolbarItem,
+  ArrowUpToolbarItem,
+  AssetToolbarItem,
+  CheckBoxToolbarItem,
+  CloudToolbarItem,
+  DefaultToolbar,
+  DefaultColorStyle,
+  DiamondToolbarItem,
+  DrawToolbarItem,
+  EllipseToolbarItem,
+  EraserToolbarItem,
+  FrameToolbarItem,
+  HandToolbarItem,
+  HeartToolbarItem,
+  HexagonToolbarItem,
+  HighlightToolbarItem,
+  LaserToolbarItem,
+  LineToolbarItem,
+  NoteToolbarItem,
+  OvalToolbarItem,
+  RectangleToolbarItem,
+  RhombusToolbarItem,
+  SelectToolbarItem,
+  StateNode,
+  StarToolbarItem,
+  TextToolbarItem,
+  Tldraw,
+  TldrawUiMenuToolItem,
+  TriangleToolbarItem,
+  XBoxToolbarItem,
+  createShapeId,
+  onDragFromToolbarToCreateShape,
+  renderPlaintextFromRichText,
+  startEditingShapeWithRichText,
+  toRichText,
+  useEditor,
+  useValue
+} from 'tldraw'
+import { AllSelection } from '@tiptap/pm/state'
 import 'tldraw/tldraw.css'
 import { useCallback, useEffect, useState } from 'react'
 
 const CANVAS_ENDPOINT = '/api/canvas'
+const SELECTION_ENDPOINT = '/api/selection'
+const SELECTION_STATE_ELEMENT_ID = 'cowart-selection-state'
+const AI_IMAGE_TOOL_ID = 'ai-image'
+const AI_IMAGE_HOLDER_LABEL = 'AI 图片'
+const AI_IMAGE_HOLDER_DEFAULT_W = 320
+const AI_IMAGE_HOLDER_DEFAULT_H = 220
+const ANNOTATION_TOOL_ID = 'cowart-annotation'
+const ANNOTATION_TOOL_LABEL = '批注'
+const ANNOTATION_TEXT_PLACEHOLDER = '输入批注'
+const ANNOTATION_DEFAULT_COLOR = 'yellow'
+const ANNOTATION_MIN_LENGTH = 8
+const ANNOTATION_BEND_RATIO = 0.12
+const ANNOTATION_MIN_BEND = 16
+const ANNOTATION_MAX_BEND = 48
+const ANNOTATION_SELECT_TEXT_MAX_ATTEMPTS = 8
+const ANNOTATION_SELECT_TEXT_SETTLE_ATTEMPTS = 4
+
+function getAiImageHolderMeta() {
+  return {
+    cowartAiImageHolder: true,
+    cowartAiImageHolderVersion: 1
+  }
+}
+
+function createAiImageHolderShape(editor, id, shapeOverrides = {}) {
+  const scale = editor.getResizeScaleFactor()
+  const { meta, props, ...shapeRecordOverrides } = shapeOverrides
+  const { scale: _scale, ...frameProps } = props ?? {}
+
+  return editor.createShape({
+    ...shapeRecordOverrides,
+    id,
+    type: 'frame',
+    meta: {
+      ...getAiImageHolderMeta(),
+      ...meta
+    },
+    props: {
+      w: AI_IMAGE_HOLDER_DEFAULT_W * scale,
+      h: AI_IMAGE_HOLDER_DEFAULT_H * scale,
+      name: AI_IMAGE_HOLDER_LABEL,
+      color: 'blue',
+      ...frameProps
+    }
+  })
+}
+
+function createAiImageHolderAtViewportCenter(editor) {
+  const scale = editor.getResizeScaleFactor()
+  const w = AI_IMAGE_HOLDER_DEFAULT_W * scale
+  const h = AI_IMAGE_HOLDER_DEFAULT_H * scale
+  const center = editor.getViewportPageBounds().center
+  const id = createShapeId()
+
+  createAiImageHolderShape(editor, id, {
+    x: center.x - w / 2,
+    y: center.y - h / 2,
+    props: { w, h }
+  })
+  editor.select(id)
+  editor.setCurrentTool('select.idle')
+}
+
+function startEditingAnnotationArrowLabel(editor, arrowId) {
+  const shape = editor.getShape(arrowId)
+  if (!shape || !editor.canEditShape(shape)) {
+    return
+  }
+
+  editor.select(arrowId)
+  startEditingShapeWithRichText(editor, arrowId, { selectAll: true })
+  editor.getCurrentTool().setCurrentToolIdMask(ANNOTATION_TOOL_ID)
+  selectAnnotationTextWhenReady(editor, arrowId)
+}
+
+function lockCurrentTool(editor) {
+  if (editor.getInstanceState().isToolLocked) return
+  editor.updateInstanceState({ isToolLocked: true })
+}
+
+function selectAnnotationTextWhenReady(editor, arrowId, attempt = 0) {
+  editor.timers.setTimeout(() => {
+    const editingShapeId = editor.getEditingShapeId()
+    if (editingShapeId !== arrowId) return
+
+    const textEditor = editor.getRichTextEditor()
+    if (textEditor) {
+      textEditor.view.focus()
+      textEditor.view.dispatch(
+        textEditor.state.tr.setSelection(new AllSelection(textEditor.state.doc)).scrollIntoView()
+      )
+    }
+
+    const didSelectText = selectAnnotationTextRange(editor, arrowId)
+    if (didSelectText && attempt >= ANNOTATION_SELECT_TEXT_SETTLE_ATTEMPTS) {
+      return
+    }
+
+    if (attempt < ANNOTATION_SELECT_TEXT_MAX_ATTEMPTS) {
+      selectAnnotationTextWhenReady(editor, arrowId, attempt + 1)
+    }
+  }, 16)
+}
+
+function selectAnnotationTextRange(editor, arrowId) {
+  const doc = editor.getContainerDocument()
+  const shapeElement = Array.from(doc.querySelectorAll('[data-shape-id]')).find(
+    (element) => element.getAttribute('data-shape-id') === arrowId
+  )
+  const editable = shapeElement?.querySelector('[contenteditable="true"]')
+
+  if (!editable || typeof editable.focus !== 'function') {
+    return false
+  }
+
+  editable.focus()
+
+  const textNodes = getTextNodes(editable)
+  if (textNodes.length === 0) {
+    return false
+  }
+
+  const range = doc.createRange()
+  const firstTextNode = textNodes[0]
+  const lastTextNode = textNodes[textNodes.length - 1]
+  range.setStart(firstTextNode, 0)
+  range.setEnd(lastTextNode, lastTextNode.textContent?.length ?? 0)
+
+  const selection = doc.getSelection()
+  if (!selection) return false
+
+  selection.removeAllRanges()
+  selection.addRange(range)
+  doc.execCommand?.('selectAll')
+
+  return selection.rangeCount > 0 && selection.toString() === editable.textContent
+}
+
+function getTextNodes(node, textNodes = []) {
+  for (const child of node.childNodes) {
+    if (child.nodeType === Node.TEXT_NODE && child.textContent) {
+      textNodes.push(child)
+    } else {
+      getTextNodes(child, textNodes)
+    }
+  }
+
+  return textNodes
+}
+
+function getDefaultAnnotationArrowBend(dx, dy, scale) {
+  const length = Math.hypot(dx, dy)
+  if (length === 0) return 0
+
+  const bend = Math.min(
+    Math.max(length * ANNOTATION_BEND_RATIO, ANNOTATION_MIN_BEND * scale),
+    ANNOTATION_MAX_BEND * scale
+  )
+
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    return dx >= 0 ? -bend : bend
+  }
+
+  return bend
+}
+
+function getAnnotationColor(editor) {
+  const color = editor.getStyleForNextShape(DefaultColorStyle)
+  return color === DefaultColorStyle.defaultValue ? ANNOTATION_DEFAULT_COLOR : color
+}
+
+class CowartAnnotationTool extends StateNode {
+  static id = ANNOTATION_TOOL_ID
+  static initial = 'idle'
+
+  static children() {
+    return [CowartAnnotationIdle, CowartAnnotationPointing]
+  }
+
+  onEnter() {
+    lockCurrentTool(this.editor)
+  }
+}
+
+class CowartAnnotationIdle extends StateNode {
+  static id = 'idle'
+
+  onEnter() {
+    this.editor.setCursor({ type: 'cross', rotation: 0 })
+  }
+
+  onPointerDown(info) {
+    this.parent.transition('pointing', info)
+  }
+
+  onCancel() {
+    this.editor.setCurrentTool('select')
+  }
+}
+
+class CowartAnnotationPointing extends StateNode {
+  static id = 'pointing'
+
+  arrowId = null
+  markId = ''
+  origin = null
+
+  onEnter() {
+    const origin = this.editor.inputs.getOriginPagePoint()
+    const scale = this.editor.getResizeScaleFactor()
+    const color = getAnnotationColor(this.editor)
+    const arrowId = createShapeId()
+
+    this.arrowId = arrowId
+    this.origin = { x: origin.x, y: origin.y }
+    this.markId = this.editor.markHistoryStoppingPoint(`creating_annotation:${arrowId}`)
+
+    this.editor.createShape({
+      id: arrowId,
+      type: 'arrow',
+      x: origin.x,
+      y: origin.y,
+      meta: {
+        cowartAnnotationArrow: true
+      },
+      props: {
+        kind: 'arc',
+        dash: 'draw',
+        size: 'm',
+        fill: 'none',
+        color,
+        labelColor: color,
+        bend: 0,
+        start: { x: 0, y: 0 },
+        end: { x: 1, y: 0 },
+        arrowheadStart: 'none',
+        arrowheadEnd: 'arrow',
+        richText: toRichText(ANNOTATION_TEXT_PLACEHOLDER),
+        labelPosition: 0,
+        font: 'draw',
+        scale
+      }
+    })
+  }
+
+  onPointerMove() {
+    this.updateArrowEnd()
+  }
+
+  onPointerUp() {
+    this.complete()
+  }
+
+  onCancel() {
+    this.cancel()
+  }
+
+  onInterrupt() {
+    this.cancel()
+  }
+
+  updateArrowEnd() {
+    if (!this.arrowId || !this.origin) return
+
+    const point = this.editor.inputs.getCurrentPagePoint()
+    this.editor.updateShapes([
+      {
+        id: this.arrowId,
+        type: 'arrow',
+        props: {
+          end: {
+            x: point.x - this.origin.x,
+            y: point.y - this.origin.y
+          }
+        }
+      }
+    ])
+  }
+
+  complete() {
+    if (!this.arrowId || !this.origin) {
+      this.editor.setCurrentTool(ANNOTATION_TOOL_ID)
+      return
+    }
+
+    this.updateArrowEnd()
+
+    const point = this.editor.inputs.getCurrentPagePoint()
+    const dx = point.x - this.origin.x
+    const dy = point.y - this.origin.y
+    const length = Math.hypot(dx, dy)
+
+    if (length < ANNOTATION_MIN_LENGTH / this.editor.getZoomLevel()) {
+      this.editor.bailToMark(this.markId)
+      this.parent.transition('idle')
+      return
+    }
+
+    this.editor.updateShapes([
+      {
+        id: this.arrowId,
+        type: 'arrow',
+        props: {
+          bend: getDefaultAnnotationArrowBend(dx, dy, this.editor.getResizeScaleFactor())
+        }
+      }
+    ])
+
+    startEditingAnnotationArrowLabel(this.editor, this.arrowId)
+  }
+
+  cancel() {
+    if (this.arrowId) {
+      this.editor.bailToMark(this.markId)
+    }
+    this.parent.transition('idle')
+  }
+}
+
+const cowartUiOverrides = {
+  translations: {
+    en: {
+      'tool.ai-image': AI_IMAGE_HOLDER_LABEL,
+      'tool.cowart-annotation': ANNOTATION_TOOL_LABEL
+    },
+    'zh-cn': {
+      'tool.ai-image': AI_IMAGE_HOLDER_LABEL,
+      'tool.cowart-annotation': ANNOTATION_TOOL_LABEL
+    }
+  },
+  tools(editor, tools) {
+    return {
+      ...tools,
+      arrow: {
+        ...tools.arrow,
+        kbd: undefined
+      },
+      [AI_IMAGE_TOOL_ID]: {
+        id: AI_IMAGE_TOOL_ID,
+        label: 'tool.ai-image',
+        icon: 'tool-frame',
+        kbd: 'a',
+        onSelect() {
+          createAiImageHolderAtViewportCenter(editor)
+        },
+        onDragStart(source, info) {
+          const scale = editor.getResizeScaleFactor()
+          onDragFromToolbarToCreateShape(editor, info, {
+            createShape: (id) =>
+              createAiImageHolderShape(editor, id, {
+                props: {
+                  w: AI_IMAGE_HOLDER_DEFAULT_W * scale,
+                  h: AI_IMAGE_HOLDER_DEFAULT_H * scale
+                }
+              }),
+            onDragEnd: (id) => editor.select(id)
+          })
+        },
+        meta: {
+          cowartTool: 'ai-image-holder'
+        }
+      },
+      [ANNOTATION_TOOL_ID]: {
+        id: ANNOTATION_TOOL_ID,
+        label: 'tool.cowart-annotation',
+        icon: 'tool-arrow',
+        kbd: 'c',
+        onSelect() {
+          lockCurrentTool(editor)
+          editor.setCurrentTool(ANNOTATION_TOOL_ID)
+        },
+        meta: {
+          cowartTool: 'annotation'
+        }
+      }
+    }
+  }
+}
+
+const cowartComponents = {
+  Toolbar: CowartToolbar
+}
+
+function CowartToolbarItem({ toolId }) {
+  const editor = useEditor()
+  const isSelected = useValue(
+    `is ${toolId} selected`,
+    () => editor.getCurrentToolId() === toolId,
+    [editor, toolId]
+  )
+
+  return <TldrawUiMenuToolItem toolId={toolId} isSelected={isSelected} />
+}
+
+function CowartToolbar(props) {
+  return (
+    <DefaultToolbar {...props}>
+      <SelectToolbarItem />
+      <HandToolbarItem />
+      <CowartToolbarItem toolId={AI_IMAGE_TOOL_ID} />
+      <CowartToolbarItem toolId={ANNOTATION_TOOL_ID} />
+      <DrawToolbarItem />
+      <EraserToolbarItem />
+      <ArrowToolbarItem />
+      <TextToolbarItem />
+      <NoteToolbarItem />
+      <AssetToolbarItem />
+      <RectangleToolbarItem />
+      <EllipseToolbarItem />
+      <TriangleToolbarItem />
+      <DiamondToolbarItem />
+      <HexagonToolbarItem />
+      <OvalToolbarItem />
+      <RhombusToolbarItem />
+      <StarToolbarItem />
+      <CloudToolbarItem />
+      <HeartToolbarItem />
+      <XBoxToolbarItem />
+      <CheckBoxToolbarItem />
+      <ArrowLeftToolbarItem />
+      <ArrowUpToolbarItem />
+      <ArrowDownToolbarItem />
+      <ArrowRightToolbarItem />
+      <LineToolbarItem />
+      <HighlightToolbarItem />
+      <LaserToolbarItem />
+      <FrameToolbarItem />
+    </DefaultToolbar>
+  )
+}
+
+function getCowartSelection(editor) {
+  const selectedShapeIds = editor.getSelectedShapeIds()
+  return selectedShapeIds.map((id) => {
+    const shape = editor.getShape(id)
+    const asset = shape?.props?.assetId ? editor.getAsset(shape.props.assetId) : null
+    return {
+      id,
+      type: shape?.type ?? null,
+      parentId: shape?.parentId ?? null,
+      x: shape?.x ?? null,
+      y: shape?.y ?? null,
+      rotation: shape?.rotation ?? null,
+      meta: shape?.meta ?? null,
+      isAiImageHolder: shape?.meta?.cowartAiImageHolder === true,
+      props: shape?.props ?? null,
+      asset: asset
+        ? {
+            id: asset.id,
+            type: asset.type,
+            name: asset.props?.name ?? null,
+            src: asset.props?.src ?? null,
+            w: asset.props?.w ?? null,
+            h: asset.props?.h ?? null,
+            mimeType: asset.props?.mimeType ?? null,
+            fileSize: asset.props?.fileSize ?? null
+          }
+        : null
+    }
+  })
+}
+
+function getCowartSelectionSnapshot(editor) {
+  return {
+    selectedShapes: getCowartSelection(editor)
+  }
+}
+
+function writeCowartSelectionState(selectionSnapshot) {
+  let stateElement = document.getElementById(SELECTION_STATE_ELEMENT_ID)
+  if (!stateElement) {
+    stateElement = document.createElement('script')
+    stateElement.id = SELECTION_STATE_ELEMENT_ID
+    stateElement.type = 'application/json'
+    document.body.append(stateElement)
+  }
+
+  stateElement.textContent = JSON.stringify({
+    ...selectionSnapshot,
+    updatedAt: new Date().toISOString()
+  })
+}
+
+function getAiImageFrameChildUpdates(editor) {
+  const { store } = editor.store.getStoreSnapshot()
+  const updates = []
+
+  for (const shape of Object.values(store)) {
+    if (shape?.typeName !== 'shape' || shape.type !== 'image') continue
+
+    const holderId = shape.meta?.cowartGeneratedForAiImageHolder
+    if (!holderId) continue
+
+    const holder = store[holderId]
+    if (
+      holder?.typeName !== 'shape' ||
+      holder.type !== 'frame' ||
+      holder.meta?.cowartAiImageHolder !== true
+    ) {
+      continue
+    }
+
+    const nextProps = {}
+    if (shape.props.w !== holder.props.w) nextProps.w = holder.props.w
+    if (shape.props.h !== holder.props.h) nextProps.h = holder.props.h
+
+    const update = {
+      id: shape.id,
+      type: 'image'
+    }
+
+    if (shape.parentId !== holder.id) update.parentId = holder.id
+    if (shape.x !== 0) update.x = 0
+    if (shape.y !== 0) update.y = 0
+    if (shape.rotation !== 0) update.rotation = 0
+    if (Object.keys(nextProps).length > 0) update.props = nextProps
+
+    if (Object.keys(update).length > 2) {
+      updates.push(update)
+    }
+  }
+
+  return updates
+}
 
 export default function App() {
   const [snapshot, setSnapshot] = useState()
@@ -32,10 +598,73 @@ export default function App() {
   }, [])
 
   const handleMount = useCallback((editor) => {
+    window.__cowartEditor = editor
+    window.__cowartSelection = () => getCowartSelection(editor)
+    let lastSyncedSelectionState = ''
+    let isSelectionStateSaving = false
+    let hasPendingSelectionState = false
+
+    async function syncSelectionState() {
+      const selectionSnapshot = getCowartSelectionSnapshot(editor)
+      writeCowartSelectionState(selectionSnapshot)
+
+      const selectionState = JSON.stringify(selectionSnapshot)
+      if (selectionState === lastSyncedSelectionState) return
+      lastSyncedSelectionState = selectionState
+
+      if (isSelectionStateSaving) {
+        hasPendingSelectionState = true
+        return
+      }
+
+      isSelectionStateSaving = true
+      try {
+        const response = await fetch(SELECTION_ENDPOINT, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            ...selectionSnapshot,
+            updatedAt: new Date().toISOString()
+          })
+        })
+        if (!response.ok) {
+          throw new Error(`Failed to save selection: ${response.status}`)
+        }
+      } catch (error) {
+        console.error(error)
+      } finally {
+        isSelectionStateSaving = false
+        if (hasPendingSelectionState) {
+          hasPendingSelectionState = false
+          syncSelectionState()
+        }
+      }
+    }
+
+    syncSelectionState()
+    const selectionStateTimer = window.setInterval(syncSelectionState, 250)
+
     let saveTimer = null
     let isSaving = false
     let hasPendingSave = false
     let hasUnsavedChanges = false
+    let isSyncingAiImageFrameChildren = false
+    let isReplacingAnnotationPlaceholder = false
+    let isSyncingAnnotationLabelColor = false
+
+    function syncAiImageFrameChildren() {
+      if (isSyncingAiImageFrameChildren) return
+
+      const updates = getAiImageFrameChildUpdates(editor)
+      if (updates.length === 0) return
+
+      isSyncingAiImageFrameChildren = true
+      try {
+        editor.updateShapes(updates)
+      } finally {
+        isSyncingAiImageFrameChildren = false
+      }
+    }
 
     async function saveCanvas() {
       if (!hasUnsavedChanges) return
@@ -69,6 +698,7 @@ export default function App() {
     }
 
     function scheduleSave() {
+      syncAiImageFrameChildren()
       hasUnsavedChanges = true
       window.clearTimeout(saveTimer)
       saveTimer = window.setTimeout(saveCanvas, 500)
@@ -79,9 +709,120 @@ export default function App() {
       scope: 'document'
     })
 
+    const unsubscribeAnnotationEditingToolLock = editor.store.listen(
+      ({ changes }) => {
+        for (const [previous, next] of Object.values(changes.updated)) {
+          if (previous?.typeName !== 'instance_page_state') continue
+          if (!previous.editingShapeId || next.editingShapeId) continue
+
+          const shape = editor.getShape(previous.editingShapeId)
+          if (shape?.meta?.cowartAnnotationArrow !== true) continue
+          if (!editor.getInstanceState().isToolLocked) continue
+
+          editor.timers.requestAnimationFrame(() => {
+            if (editor.getEditingShapeId()) return
+            if (editor.getCurrentToolId() !== 'select') return
+            editor.setCurrentTool(ANNOTATION_TOOL_ID)
+          })
+        }
+      },
+      {
+        source: 'all',
+        scope: 'session'
+      }
+    )
+
+    const unsubscribeAnnotationPlaceholderReplacement = editor.store.listen(
+      ({ changes }) => {
+        if (isReplacingAnnotationPlaceholder) return
+
+        const replacements = []
+        for (const [previous, next] of Object.values(changes.updated)) {
+          if (previous?.typeName !== 'shape' || next?.typeName !== 'shape') continue
+          if (previous.type !== 'arrow' || next.type !== 'arrow') continue
+          if (next.meta?.cowartAnnotationArrow !== true) continue
+          if (!previous.props?.richText || !next.props?.richText) continue
+
+          const previousText = renderPlaintextFromRichText(editor, previous.props.richText)
+          if (previousText !== ANNOTATION_TEXT_PLACEHOLDER) continue
+
+          const nextText = renderPlaintextFromRichText(editor, next.props.richText)
+          if (!nextText.startsWith(ANNOTATION_TEXT_PLACEHOLDER)) continue
+
+          const replacementText = nextText.slice(ANNOTATION_TEXT_PLACEHOLDER.length)
+          if (!replacementText) continue
+
+          replacements.push({
+            id: next.id,
+            type: 'arrow',
+            props: {
+              richText: toRichText(replacementText)
+            }
+          })
+        }
+
+        if (replacements.length === 0) return
+
+        isReplacingAnnotationPlaceholder = true
+        try {
+          editor.updateShapes(replacements)
+        } finally {
+          isReplacingAnnotationPlaceholder = false
+        }
+      },
+      {
+        source: 'user',
+        scope: 'document'
+      }
+    )
+
+    const unsubscribeAnnotationColorSync = editor.store.listen(
+      ({ changes }) => {
+        if (isSyncingAnnotationLabelColor) return
+
+        const updates = []
+        for (const [_previous, next] of Object.values(changes.updated)) {
+          if (next?.typeName !== 'shape') continue
+          if (next.type !== 'arrow') continue
+          if (next.meta?.cowartAnnotationArrow !== true) continue
+          if (next.props?.color === next.props?.labelColor) continue
+
+          updates.push({
+            id: next.id,
+            type: 'arrow',
+            props: {
+              labelColor: next.props.color
+            }
+          })
+        }
+
+        if (updates.length === 0) return
+
+        isSyncingAnnotationLabelColor = true
+        try {
+          editor.updateShapes(updates)
+        } finally {
+          isSyncingAnnotationLabelColor = false
+        }
+      },
+      {
+        source: 'user',
+        scope: 'document'
+      }
+    )
+
     return () => {
       window.clearTimeout(saveTimer)
+      window.clearInterval(selectionStateTimer)
+      if (window.__cowartEditor === editor) {
+        delete window.__cowartEditor
+        delete window.__cowartSelection
+      }
+      document.getElementById(SELECTION_STATE_ELEMENT_ID)?.remove()
       unsubscribe()
+      unsubscribeAnnotationEditingToolLock()
+      unsubscribeAnnotationPlaceholderReplacement()
+      unsubscribeAnnotationColorSync()
       saveCanvas()
     }
   }, [])
@@ -104,7 +845,14 @@ export default function App() {
 
   return (
     <main className="cowart-canvas" aria-label="Cowart infinite canvas">
-      <Tldraw snapshot={snapshot ?? undefined} inferDarkMode onMount={handleMount} />
+      <Tldraw
+        snapshot={snapshot ?? undefined}
+        inferDarkMode
+        onMount={handleMount}
+        overrides={cowartUiOverrides}
+        components={cowartComponents}
+        tools={[CowartAnnotationTool]}
+      />
     </main>
   )
 }

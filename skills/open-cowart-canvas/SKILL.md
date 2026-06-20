@@ -21,6 +21,8 @@ Keep that process running. It serves the tldraw infinite canvas at:
 http://127.0.0.1:43217
 ```
 
+If Vite reports that the port is already in use and prints another `Local:` URL, open that actual URL instead. For example, if the output says `Local: http://127.0.0.1:43218/`, open port `43218`.
+
 If `COWART_PORT` is set before starting the script, open that port instead:
 
 ```bash
@@ -31,13 +33,39 @@ Then use the in-app browser to open the URL. If the browser-control skill is ava
 
 ## Notes
 
-The canvas data is stored on disk in the user's Codex project canvas folder:
+The canvas data is stored on disk in the user's Codex project canvas folder, split by tldraw page:
+
+```text
+canvas/pages/<page-id>/cowart-canvas.json
+canvas/pages/<page-id>/assets/
+canvas/pages/manifest.json
+```
+
+Each page's `cowart-canvas.json` contains that page's tldraw records and only the assets used by shapes on that page. Page-local image files live beside the page snapshot under `assets/`. The page directory name is the page id without the `page:` prefix, URL-encoded if needed.
+
+The React app loads all page snapshots through the local Vite API before mounting `tldraw`, merges them into one store snapshot for the editor, and saves changes back out as one `cowart-canvas.json` per page. This means canvas data lives in the project folder rather than in browser local storage.
+
+When inserting or updating image assets programmatically, prefer a page-local file reference:
+
+```text
+canvas/pages/<page-id>/assets/example.png
+```
+
+with the asset `props.src` set to:
+
+```text
+/page-assets/<page-id>/example.png
+```
+
+The Vite service maps `/page-assets/<page-id>/...` to the matching page's `assets/` folder. It also supports the older shared route `/assets/...` for files under `canvas/assets/`; on save, local `/assets/...` references and data URLs are copied into the appropriate page's `assets/` folder and rewritten to `/page-assets/<page-id>/...`.
+
+For backward compatibility, if `canvas/pages/` does not contain page snapshots yet, the service will read the legacy single-file snapshot:
 
 ```text
 canvas/cowart-canvas.json
 ```
 
-The React app loads that file through the local Vite API before mounting `tldraw`, and saves `tldraw` store snapshots back to the same file when the document changes. This means canvas data lives in the project folder rather than in browser local storage.
+The next save writes the current document into the per-page layout.
 
 The project folder can be supplied either as the first script argument or with `COWART_PROJECT_DIR`:
 
@@ -45,4 +73,4 @@ The project folder can be supplied either as the first script argument or with `
 COWART_PROJECT_DIR=/path/to/project /Users/bytedance/plugins/cowart/scripts/start-canvas.sh
 ```
 
-Both forms write to `/path/to/project/canvas/cowart-canvas.json`. If a caller needs an exact directory, set `COWART_CANVAS_DIR`; it takes precedence over both the first argument and `COWART_PROJECT_DIR`.
+Both forms use `/path/to/project/canvas/` as the canvas root and write page snapshots plus page-local assets under `/path/to/project/canvas/pages/`. If a caller needs an exact canvas root, set `COWART_CANVAS_DIR`; it takes precedence over both the first argument and `COWART_PROJECT_DIR`, and page snapshots plus page assets are written under `$COWART_CANVAS_DIR/pages/`.
