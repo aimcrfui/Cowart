@@ -45,12 +45,51 @@ import { useCallback, useEffect, useState } from 'react'
 
 const COWART_BASE_URL =
   typeof window !== 'undefined' && typeof window.__COWART_CANVAS_BASE_URL__ === 'string'
-    ? window.__COWART_CANVAS_BASE_URL__
+    ? normalizeCowartBaseUrl(window.__COWART_CANVAS_BASE_URL__)
     : ''
+
+function normalizeCowartBaseUrl(value) {
+  if (!value) return ''
+  try {
+    const url = new URL(value)
+    if (!url.pathname.endsWith('/')) url.pathname = `${url.pathname}/`
+    return url.toString()
+  } catch {
+    return ''
+  }
+}
 
 function cowartUrl(path) {
   if (!COWART_BASE_URL) return path
   return new URL(path, COWART_BASE_URL).toString()
+}
+
+function isLocalCowartAssetPath(src) {
+  return src.startsWith('/assets/') || src.startsWith('/page-assets/')
+}
+
+function withCowartAssetUrls(snapshot) {
+  if (!snapshot?.store || !COWART_BASE_URL) return snapshot
+
+  let changed = false
+  const store = {}
+  for (const [id, record] of Object.entries(snapshot.store)) {
+    const src = record?.typeName === 'asset' ? record.props?.src : null
+    if (typeof src === 'string' && isLocalCowartAssetPath(src)) {
+      store[id] = {
+        ...record,
+        props: {
+          ...record.props,
+          src: cowartUrl(src)
+        }
+      }
+      changed = true
+      continue
+    }
+    store[id] = record
+  }
+
+  return changed ? { ...snapshot, store } : snapshot
 }
 
 const CANVAS_ENDPOINT = cowartUrl('/api/canvas')
@@ -660,7 +699,7 @@ export default function App() {
           canvasResponse.json(),
           viewStateResponse.json()
         ])
-        setSnapshot(canvasData.snapshot ?? null)
+        setSnapshot(withCowartAssetUrls(canvasData.snapshot ?? null))
         setViewState(viewStateData.viewState ?? null)
       } catch (error) {
         if (error.name === 'AbortError') return

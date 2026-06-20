@@ -3,7 +3,9 @@ import react from '@vitejs/plugin-react'
 import { createReadStream } from 'node:fs'
 import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
+const pluginDir = dirname(fileURLToPath(import.meta.url))
 const projectDir = resolve(process.env.COWART_PROJECT_DIR ?? process.cwd())
 const canvasDir = resolve(process.env.COWART_CANVAS_DIR ?? join(projectDir, 'canvas'))
 const canvasFile = join(canvasDir, 'cowart-canvas.json')
@@ -16,8 +18,11 @@ const canvasFileName = 'cowart-canvas.json'
 const pageIdPrefix = 'page:'
 const globalAssetsRoute = '/assets/'
 const pageAssetsRoute = '/page-assets/'
+const widgetAssetsRoute = '/cowart-widget-assets/'
 
 const mimeTypes = new Map([
+  ['.css', 'text/css; charset=utf-8'],
+  ['.js', 'text/javascript; charset=utf-8'],
   ['.apng', 'image/apng'],
   ['.avif', 'image/avif'],
   ['.gif', 'image/gif'],
@@ -233,16 +238,44 @@ function localAssetFilePathFromUrl(src) {
   return isSafeChildPath(baseDir, filePath) ? filePath : null
 }
 
+function localAssetRouteFromSrc(src) {
+  if (src.startsWith(globalAssetsRoute) || src.startsWith(pageAssetsRoute) || src.startsWith('data:')) {
+    return src
+  }
+
+  try {
+    const url = new URL(src)
+    if (
+      (url.hostname === '127.0.0.1' || url.hostname === 'localhost') &&
+      (url.pathname.startsWith(globalAssetsRoute) || url.pathname.startsWith(pageAssetsRoute))
+    ) {
+      return url.pathname
+    }
+  } catch {
+    // Non-URL strings are handled by the local route checks above.
+  }
+
+  return src
+}
+
 async function localizePageAsset(asset, pageId) {
   const src = asset?.props?.src
-  if (!src || typeof src !== 'string' || /^https?:\/\//.test(src)) return asset
+  if (!src || typeof src !== 'string') return asset
+
+  const localSrc = localAssetRouteFromSrc(src)
+  if (/^https?:\/\//.test(localSrc)) return asset
 
   const currentPagePrefix = `${pageAssetsRoute}${pageDirName(pageId)}/`
-  if (src.startsWith(currentPagePrefix)) return asset
+  if (localSrc.startsWith(currentPagePrefix)) {
+    if (localSrc === src) return asset
+    const localizedAsset = structuredClone(asset)
+    localizedAsset.props.src = localSrc
+    return localizedAsset
+  }
 
   const localizedAsset = structuredClone(asset)
-  const dataUrl = src.startsWith('data:') ? parseDataUrl(src) : null
-  const sourceFilePath = dataUrl ? null : localAssetFilePathFromUrl(src)
+  const dataUrl = localSrc.startsWith('data:') ? parseDataUrl(localSrc) : null
+  const sourceFilePath = dataUrl ? null : localAssetFilePathFromUrl(localSrc)
   if (!dataUrl && !sourceFilePath) return localizedAsset
 
   const fileName = sanitizeAssetFileName(
@@ -434,10 +467,53 @@ async function serveCanvasAsset(req, res, next) {
   }
 }
 
+async function serveCowartWidgetAsset(req, res, next) {
+  const url = new URL(req.url, 'http://127.0.0.1')
+  if (!url.pathname.startsWith(widgetAssetsRoute)) {
+    next()
+    return
+  }
+
+  const fileName = decodeURIComponent(url.pathname.slice(widgetAssetsRoute.length))
+  const allowedFiles = new Map([
+    ['cowart-app.js', join(pluginDir, 'dist', 'assets', 'cowart-app.js')],
+    ['cowart-style.css', join(pluginDir, 'dist', 'assets', 'cowart-style.css')]
+  ])
+  const filePath = allowedFiles.get(fileName)
+  if (!filePath) {
+    res.statusCode = 404
+    res.end('Not found')
+    return
+  }
+
+  try {
+    const fileStat = await stat(filePath)
+    if (!fileStat.isFile()) {
+      res.statusCode = 404
+      res.end('Not found')
+      return
+    }
+    res.statusCode = 200
+    res.setHeader('access-control-allow-origin', '*')
+    res.setHeader('content-type', mimeTypes.get(extname(filePath).toLowerCase()) ?? 'application/octet-stream')
+    res.setHeader('content-length', String(fileStat.size))
+    res.setHeader('cache-control', 'no-cache')
+    createReadStream(filePath).pipe(res)
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      res.statusCode = 404
+      res.end('Not found')
+      return
+    }
+    next(error)
+  }
+}
+
 function canvasStoragePlugin() {
   return {
     name: 'cowart-canvas-storage',
     configureServer(server) {
+      server.middlewares.use(serveCowartWidgetAsset)
       server.middlewares.use(serveCanvasAsset)
 
       server.middlewares.use('/api/selection', async (req, res) => {
@@ -563,6 +639,16 @@ function canvasStoragePlugin() {
 
 export default defineConfig({
   plugins: [react(), canvasStoragePlugin()],
+  build: {
+    cssCodeSplit: false,
+    rollupOptions: {
+      output: {
+        inlineDynamicImports: true,
+        entryFileNames: 'assets/cowart-app.js',
+        assetFileNames: 'assets/cowart-[name][extname]'
+      }
+    }
+  },
   server: {
     cors: true,
     host: '127.0.0.1',

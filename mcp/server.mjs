@@ -1,4 +1,6 @@
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 import readline from "node:readline";
 
@@ -9,6 +11,8 @@ const TOOL_RENDER_WIDGET = "render_cowart_canvas_widget";
 const WIDGET_URI = "ui://widget/cowart/canvas.html";
 const WIDGET_MIME_TYPE = "text/html;profile=mcp-app";
 const DEFAULT_CANVAS_URL = "http://127.0.0.1:43217/";
+const require = createRequire(import.meta.url);
+let cachedMcpAppsGlobalScript = "";
 const JsonRpcError = {
   METHOD_NOT_FOUND: -32601,
   INVALID_PARAMS: -32602,
@@ -26,6 +30,8 @@ const widgetMeta = {
       resourceDomains: [
         "http://127.0.0.1:*",
         "http://localhost:*",
+        "data:",
+        "blob:",
       ],
     },
   },
@@ -39,6 +45,8 @@ const widgetMeta = {
     resource_domains: [
       "http://127.0.0.1:*",
       "http://localhost:*",
+      "data:",
+      "blob:",
     ],
   },
 };
@@ -73,6 +81,147 @@ function normalizeCanvasUrl(value) {
   } catch (error) {
     throw new Error(`Invalid Cowart canvas URL: ${error.message}`);
   }
+}
+
+function mcpAppsGlobalScript() {
+  if (cachedMcpAppsGlobalScript) return cachedMcpAppsGlobalScript;
+
+  const sourcePath = require.resolve("@modelcontextprotocol/ext-apps/app-with-deps");
+  const source = readFileSync(sourcePath, "utf8");
+  const exportStart = source.lastIndexOf("export{");
+  if (exportStart === -1) {
+    throw new Error("Could not find ext-apps browser export block.");
+  }
+
+  const exportBlock = source.slice(exportStart).match(/^export\{([^}]+)\};?\s*$/s);
+  if (!exportBlock) {
+    throw new Error("Could not parse ext-apps browser export block.");
+  }
+
+  const exportMap = parseExportMap(exportBlock[1]);
+  const requiredExports = ["App"];
+  for (const name of requiredExports) {
+    if (!exportMap.has(name)) {
+      throw new Error(`Missing ext-apps browser export: ${name}`);
+    }
+  }
+
+  cachedMcpAppsGlobalScript = [
+    source.slice(0, exportStart),
+    ";globalThis.__COWART_MCP_APPS__={",
+    requiredExports.map((name) => `${JSON.stringify(name)}:${exportMap.get(name)}`).join(","),
+    "};",
+  ].join("");
+  return cachedMcpAppsGlobalScript;
+}
+
+function parseExportMap(body) {
+  const exportMap = new Map();
+  for (const rawEntry of body.split(",")) {
+    const entry = rawEntry.trim();
+    if (!entry) continue;
+    const parts = entry.split(/\s+as\s+/);
+    const local = parts[0]?.trim();
+    const exported = (parts[1] || parts[0])?.trim();
+    if (local && exported) exportMap.set(exported, local);
+  }
+  return exportMap;
+}
+
+function escapeInlineScript(source) {
+  return source.replaceAll("</script", "<\\/script").replaceAll("</SCRIPT", "<\\/SCRIPT");
+}
+
+function cowartHostBridgeScript() {
+  return `(() => {
+  "use strict";
+
+  const apps = globalThis.__COWART_MCP_APPS__;
+  if (!apps || typeof apps.App !== "function") return;
+
+  function publishHostGlobals(globals) {
+    window.openai = Object.assign(window.openai || {}, globals);
+    window.dispatchEvent(new CustomEvent("openai:set_globals", {
+      detail: { globals: window.openai },
+    }));
+  }
+
+  function payloadFromToolResult(result) {
+    if (!result || typeof result !== "object") return {};
+    const metadata = result._meta && typeof result._meta === "object" ? result._meta : {};
+    return metadata.widgetData || result.structuredContent || result;
+  }
+
+  function handleToolResult(result) {
+    const payload = payloadFromToolResult(result);
+    if (typeof payload.canvasUrl === "string" && payload.canvasUrl) {
+      window.__COWART_CANVAS_BASE_URL__ = payload.canvasUrl;
+    }
+    publishHostGlobals({
+      rawToolResult: result,
+      toolOutput: payload,
+      widgetData: payload,
+    });
+    window.cowartMcp?.notifyResize?.();
+  }
+
+  function currentSize() {
+    const root = document.documentElement;
+    const body = document.body;
+    return {
+      width: Math.ceil(window.innerWidth || root.clientWidth || 0),
+      height: Math.ceil(Math.max(
+        root.scrollHeight || 0,
+        root.offsetHeight || 0,
+        body?.scrollHeight || 0,
+        body?.offsetHeight || 0,
+      )),
+    };
+  }
+
+  let mcpApp = null;
+  window.cowartMcp = {
+    requestDisplayMode: async (request) => {
+      if (!mcpApp || typeof mcpApp.requestDisplayMode !== "function") return {};
+      return mcpApp.requestDisplayMode(typeof request === "string" ? { mode: request } : request);
+    },
+    notifyResize: () => {
+      if (!mcpApp || typeof mcpApp.sendSizeChanged !== "function") return;
+      try {
+        mcpApp.sendSizeChanged(currentSize());
+      } catch {}
+    },
+  };
+
+  try {
+    mcpApp = new apps.App(
+      { name: "cowart-canvas-widget", version: ${JSON.stringify(SERVER_VERSION)} },
+      { availableDisplayModes: ["inline", "fullscreen"] },
+      { autoResize: true },
+    );
+    mcpApp.addEventListener("hostcontextchanged", (context) => {
+      publishHostGlobals({
+        hostContext: context,
+        displayMode: context?.displayMode,
+        availableDisplayModes: context?.availableDisplayModes,
+      });
+    });
+    mcpApp.addEventListener("toolresult", handleToolResult);
+    window.addEventListener("resize", () => window.cowartMcp.notifyResize());
+
+    mcpApp.ready = mcpApp.connect()
+      .then(() => {
+        publishHostGlobals({
+          hostContext: mcpApp.getHostContext && mcpApp.getHostContext(),
+        });
+        return window.cowartMcp.requestDisplayMode({ mode: "fullscreen" });
+      })
+      .then(() => window.cowartMcp.notifyResize())
+      .catch(() => {});
+  } catch {
+    // The widget still works inline when the host Apps bridge is unavailable.
+  }
+})();`;
 }
 
 function resolveSelectionFile(args = {}) {
@@ -124,159 +273,128 @@ function cowartWidgetHtml() {
         font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         overflow: hidden;
       }
-      #cowartWidgetStatus {
+      #root {
         display: grid;
-        height: 100%;
-        min-height: 640px;
         place-items: center;
-        padding: 24px;
-        text-align: center;
       }
-      .cowart-widget-status__inner {
-        display: grid;
-        gap: 10px;
+      #cowartWidgetStatus {
         max-width: 520px;
+        padding: 24px;
         color: #4a5568;
         font-size: 13px;
         line-height: 1.45;
-      }
-      .cowart-widget-status__title {
-        color: #1f2430;
-        font-size: 15px;
-        font-weight: 650;
+        text-align: center;
       }
     </style>
+    <script id="cowartMcpAppsBundle">
+      ${escapeInlineScript(mcpAppsGlobalScript())}
+    </script>
+    <script id="cowartMcpHostBridge">
+      ${cowartHostBridgeScript()}
+    </script>
   </head>
   <body>
     <div id="root">
-      <main id="cowartWidgetStatus" aria-live="polite">
-        <div class="cowart-widget-status__inner">
-          <div class="cowart-widget-status__title" id="cowartStatusTitle">Opening Cowart Canvas...</div>
-          <div id="cowartStatusText">Waiting for the canvas URL from Codex.</div>
-        </div>
-      </main>
+      <main id="cowartWidgetStatus" aria-live="polite">Opening Cowart Canvas...</main>
     </div>
-    <script>
+    <script id="cowartCanvasLoader">
       (() => {
         const fallbackUrl = ${JSON.stringify(DEFAULT_CANVAS_URL)};
-        const statusTitle = document.getElementById("cowartStatusTitle");
-        const statusText = document.getElementById("cowartStatusText");
-        let latestPayload = {};
-        let loaded = false;
-
-        function isNonEmptyPayload(payload) {
-          return Boolean(payload && typeof payload === "object" && Object.keys(payload).length > 0);
-        }
+        let latestCanvasUrl = "";
+        let didStart = false;
 
         function payloadFromToolResult(result) {
-          if (!result || typeof result !== "object") return null;
-          if (result._meta?.widgetData && typeof result._meta.widgetData === "object") {
-            return result._meta.widgetData;
+          if (!result || typeof result !== "object") return {};
+          const metadata = result._meta && typeof result._meta === "object" ? result._meta : {};
+          return metadata.widgetData || result.structuredContent || result;
+        }
+
+        function normalizeCanvasUrl(value) {
+          try {
+            const url = new URL(value || fallbackUrl);
+            if (!url.pathname.endsWith("/")) url.pathname += "/";
+            return url.toString();
+          } catch {
+            return fallbackUrl;
           }
-          if (result.structuredContent && typeof result.structuredContent === "object") {
-            return result.structuredContent;
-          }
-          return result;
-        }
-
-        function toolPayload() {
-          const openai = window.openai || {};
-          const candidates = [
-            payloadFromToolResult(openai.toolOutput),
-            payloadFromToolResult(openai.rawToolResult),
-            openai.widgetData,
-          ];
-          return candidates.find(isNonEmptyPayload) || {};
-        }
-
-        function canvasUrl() {
-          const payload = latestPayload.canvasUrl ? latestPayload : toolPayload();
-          return payload.canvasUrl || fallbackUrl;
-        }
-
-        function setStatus(title, text) {
-          statusTitle.textContent = title;
-          statusText.textContent = text;
         }
 
         function rememberPayload(payload) {
-          if (!isNonEmptyPayload(payload)) return;
-          latestPayload = { ...latestPayload, ...payload };
-        }
-
-        function assetUrl(baseUrl, path) {
-          return new URL(path, baseUrl).toString();
-        }
-
-        function appendModule(src, { inline = false } = {}) {
-          const script = document.createElement("script");
-          script.type = "module";
-          script.async = false;
-          if (inline) {
-            script.textContent = src;
-          } else {
-            script.src = src;
+          if (typeof payload?.canvasUrl === "string" && payload.canvasUrl) {
+            latestCanvasUrl = payload.canvasUrl;
           }
-          return new Promise((resolve, reject) => {
-            script.onload = resolve;
-            script.onerror = () => {
-              reject(new Error("The Cowart widget could not load " + (inline ? "an inline module." : src)));
-            };
-            document.head.appendChild(script);
-          });
         }
 
-        function reactRefreshPreamble(baseUrl) {
-          const refreshUrl = JSON.stringify(assetUrl(baseUrl, "/@react-refresh"));
-          return [
-            "import RefreshRuntime from " + refreshUrl + ";",
-            "RefreshRuntime.injectIntoGlobalHook(window);",
-            "window.$RefreshReg$ = () => {};",
-            "window.$RefreshSig$ = () => (type) => type;",
-            "window.__vite_plugin_react_preamble_installed__ = true;"
-          ].join("\\n");
+        function setStatus(message) {
+          const status = document.getElementById("cowartWidgetStatus");
+          if (status) status.textContent = message;
         }
 
-        async function load() {
-          if (loaded) return;
-          const url = canvasUrl();
-          setStatus("Opening Cowart Canvas...", url);
-          loaded = true;
-          window.__COWART_CANVAS_BASE_URL__ = url;
+        function assetUrl(canvasUrl, fileName) {
+          return new URL("cowart-widget-assets/" + fileName, canvasUrl).toString();
+        }
+
+        async function fetchText(url, label) {
+          const response = await fetch(url, { cache: "no-store" });
+          if (!response.ok) {
+            throw new Error(label + " returned " + response.status);
+          }
+          return response.text();
+        }
+
+        async function start() {
+          if (didStart) return;
+          didStart = true;
+          const canvasUrl = normalizeCanvasUrl(latestCanvasUrl);
+          window.__COWART_CANVAS_BASE_URL__ = canvasUrl;
+          setStatus("Loading Cowart Canvas...");
+
           try {
-            await appendModule(reactRefreshPreamble(url), { inline: true });
-            await appendModule(assetUrl(url, "/@vite/client"));
-            await appendModule(assetUrl(url, "/src/main.jsx"));
+            const [styleText, scriptText] = await Promise.all([
+              fetchText(assetUrl(canvasUrl, "cowart-style.css"), "Cowart stylesheet"),
+              fetchText(assetUrl(canvasUrl, "cowart-app.js"), "Cowart app bundle"),
+            ]);
+
+            const stylesheet = document.createElement("style");
+            stylesheet.id = "cowartCanvasStyles";
+            stylesheet.textContent = styleText;
+            document.head.appendChild(stylesheet);
+
+            const script = document.createElement("script");
+            const scriptUrl = URL.createObjectURL(new Blob([scriptText], { type: "text/javascript" }));
+            script.src = scriptUrl;
+            script.async = false;
+            script.addEventListener("load", () => {
+              URL.revokeObjectURL(scriptUrl);
+              window.cowartMcp?.notifyResize?.();
+            });
+            script.addEventListener("error", () => {
+              URL.revokeObjectURL(scriptUrl);
+              setStatus("Cowart Canvas could not run its app bundle.");
+            });
+            document.body.appendChild(script);
           } catch (error) {
-            loaded = false;
-            setStatus(
-              "Cowart Canvas could not load",
-              error instanceof Error ? error.message : "The Cowart widget could not load the local Vite modules."
-            );
+            setStatus("Cowart Canvas could not load its app bundle.");
+            console.error(error);
           }
         }
 
         window.addEventListener("openai:set_globals", (event) => {
-          rememberPayload(payloadFromToolResult(event.detail?.globals?.toolOutput));
-          rememberPayload(event.detail?.globals?.widgetData);
-          load();
+          const globals = event.detail?.globals || {};
+          rememberPayload(globals.widgetData);
+          rememberPayload(globals.toolOutput);
+          start();
         });
         window.addEventListener("message", (event) => {
           const result = event.data?.params?.result;
           if (event.data?.method !== "ui/notifications/tool-result" || !result) return;
           rememberPayload(payloadFromToolResult(result));
-          load();
+          start();
         });
 
-        rememberPayload(toolPayload());
-        if (latestPayload.canvasUrl) {
-          load();
-        } else {
-          setTimeout(() => {
-            if (latestPayload.canvasUrl || loaded) return;
-            load();
-          }, 1200);
-        }
+        rememberPayload(window.openai?.widgetData);
+        rememberPayload(window.openai?.toolOutput);
+        window.setTimeout(start, 800);
       })();
     </script>
   </body>
