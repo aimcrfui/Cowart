@@ -44,6 +44,7 @@ import 'tldraw/tldraw.css'
 import { useCallback, useEffect, useState } from 'react'
 
 const CANVAS_ENDPOINT = '/api/canvas'
+const CANVAS_EVENTS_ENDPOINT = '/api/canvas-events'
 const SELECTION_ENDPOINT = '/api/selection'
 const VIEW_STATE_ENDPOINT = '/api/view-state'
 const SELECTION_STATE_ELEMENT_ID = 'cowart-selection-state'
@@ -61,6 +62,34 @@ const ANNOTATION_MAX_BEND = 48
 const ANNOTATION_LABEL_POSITION = 0
 const ANNOTATION_SELECT_TEXT_MAX_ATTEMPTS = 8
 const ANNOTATION_SELECT_TEXT_SETTLE_ATTEMPTS = 4
+
+function isCanvasSnapshot(value) {
+  return value && typeof value === 'object' && value.store && value.schema
+}
+
+function recordsAreEqual(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
+function applyRemoteCanvasSnapshot(editor, snapshot, { preserveLocalChanges = false } = {}) {
+  if (!isCanvasSnapshot(snapshot)) return 0
+
+  const migratedSnapshot = editor.store.migrateSnapshot(snapshot)
+  const recordsToPut = Object.values(migratedSnapshot.store).filter((record) => {
+    const localRecord = editor.store.get(record.id)
+    if (!localRecord) return true
+    if (preserveLocalChanges) return false
+    return !recordsAreEqual(localRecord, record)
+  })
+
+  if (recordsToPut.length === 0) return 0
+
+  editor.store.mergeRemoteChanges(() => {
+    editor.store.put(recordsToPut)
+  })
+
+  return recordsToPut.length
+}
 
 function getAiImageHolderMeta() {
   return {
@@ -765,6 +794,7 @@ export default function App() {
     let hasUnsavedChanges = false
     let isSyncingAiImageFrameChildren = false
     let isSyncingAnnotationLabelColor = false
+    let remoteLoadController = null
 
     function syncAiImageFrameChildren() {
       if (isSyncingAiImageFrameChildren) return
@@ -818,10 +848,54 @@ export default function App() {
       saveTimer = window.setTimeout(saveCanvas, 500)
     }
 
+    async function loadRemoteCanvasSnapshot() {
+      remoteLoadController?.abort()
+      const controller = new AbortController()
+      remoteLoadController = controller
+      const preserveLocalChanges = hasUnsavedChanges || isSaving
+
+      try {
+        const response = await fetch(CANVAS_ENDPOINT, { signal: controller.signal })
+        if (!response.ok) {
+          throw new Error(`Failed to refresh canvas: ${response.status}`)
+        }
+
+        const canvasData = await response.json()
+        const changedRecords = applyRemoteCanvasSnapshot(editor, canvasData.snapshot, {
+          preserveLocalChanges
+        })
+
+        if (changedRecords > 0 && preserveLocalChanges) {
+          hasUnsavedChanges = true
+          if (isSaving) {
+            hasPendingSave = true
+          } else {
+            scheduleSave()
+          }
+        }
+      } catch (error) {
+        if (error.name === 'AbortError') return
+        console.error(error)
+      } finally {
+        if (remoteLoadController === controller) {
+          remoteLoadController = null
+        }
+      }
+    }
+
     const unsubscribe = editor.store.listen(scheduleSave, {
       source: 'user',
       scope: 'document'
     })
+
+    let canvasEvents = null
+    if ('EventSource' in window) {
+      canvasEvents = new EventSource(CANVAS_EVENTS_ENDPOINT)
+      canvasEvents.addEventListener('canvas-changed', loadRemoteCanvasSnapshot)
+      canvasEvents.onerror = (error) => {
+        console.warn('Cowart canvas live refresh disconnected.', error)
+      }
+    }
 
     const unsubscribeAnnotationEditingToolLock = editor.store.listen(
       ({ changes }) => {
@@ -884,6 +958,8 @@ export default function App() {
       window.clearTimeout(saveTimer)
       window.clearInterval(selectionStateTimer)
       window.clearInterval(viewStateTimer)
+      remoteLoadController?.abort()
+      canvasEvents?.close()
       if (window.__cowartEditor === editor) {
         delete window.__cowartEditor
         delete window.__cowartSelection

@@ -58,7 +58,14 @@ The user is responsible for providing the relevant screenshot(s). Do not auto-ca
    annotation-edit-20260620-153012.png
    ```
 
-6. Insert the revised image beside the original.
+6. Insert the revised image beside the original with Cowart MCP.
+
+   Prefer the Cowart MCP `insert_cowart_image` tool. Do not hand-write
+   tldraw `asset` / `shape` records or fractional `index` keys unless the MCP
+   tool is unavailable. The tool copies the bitmap into the page-local assets
+   folder, creates the tldraw image asset and image shape, generates a valid
+   tldraw fractional index, places the image beside the anchor while avoiding
+   overlaps, and saves through the running Cowart service.
 
    Add a new tldraw image asset and a new image shape. Do not update, remove, hide, reparent, or reorder the original image, the original `AI 图片` frame, or any annotation shapes.
 
@@ -94,7 +101,35 @@ The user is responsible for providing the relevant screenshot(s). Do not auto-ca
 
    Only do Cowart state access after the bitmap is generated. Use this access only to insert the new image beside the anchor or in a nearby clear area, not to discover edit intent.
 
-   Prefer updating the required store snapshot and saving through:
+   Preferred MCP call shape:
+
+   ```json
+   {
+     "imagePath": "/absolute/path/to/annotation-edit-20260620-153012.png",
+     "projectDir": "/absolute/path/to/user/codex-project",
+     "cowartUrl": "http://127.0.0.1:43217",
+     "anchorShapeId": "<selected source image or frame id>",
+     "placement": "right",
+     "margin": 40,
+     "matchAnchor": true,
+     "fileName": "annotation-edit-20260620-153012.png",
+     "annotationScreenshot": "<source screenshot file name when available>",
+     "shapeMeta": {
+       "cowartGeneratedFromAnnotationEdit": true
+     },
+     "altText": "Revised image generated from Cowart annotation screenshot"
+   }
+   ```
+
+   If the running Cowart service uses a Vite fallback port, pass the actual
+   browser URL such as `http://127.0.0.1:43218` as `cowartUrl`.
+
+   The MCP tool must return the new `assetId`, `shapeId`, saved asset path,
+   page id, bounds, and generated `index`. Confirm that the returned `index` is
+   a valid tldraw fractional index and not a custom descriptive string.
+
+   Fallback only when MCP is unavailable: update the required store snapshot and
+   save through:
 
    ```bash
    curl -s -X PUT http://127.0.0.1:43217/api/canvas \
@@ -102,7 +137,7 @@ The user is responsible for providing the relevant screenshot(s). Do not auto-ca
      --data-binary @<updated-snapshot.json>
    ```
 
-   Use page-local image asset URLs:
+   In fallback mode, use page-local image asset URLs:
 
    ```text
    /page-assets/<page-dir>/<filename>

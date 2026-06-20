@@ -16,6 +16,8 @@ const canvasFileName = 'cowart-canvas.json'
 const pageIdPrefix = 'page:'
 const globalAssetsRoute = '/assets/'
 const pageAssetsRoute = '/page-assets/'
+const canvasEventClients = new Set()
+let canvasEventVersion = 0
 
 const mimeTypes = new Map([
   ['.apng', 'image/apng'],
@@ -32,6 +34,34 @@ function sendJson(res, statusCode, payload) {
   res.statusCode = statusCode
   res.setHeader('content-type', 'application/json')
   res.end(JSON.stringify(payload))
+}
+
+function sendCanvasEvent(res, payload) {
+  res.write(`event: canvas-changed\n`)
+  res.write(`id: ${payload.version}\n`)
+  res.write(`data: ${JSON.stringify(payload)}\n\n`)
+}
+
+function broadcastCanvasChanged(result) {
+  const payload = {
+    version: ++canvasEventVersion,
+    updatedAt: new Date().toISOString(),
+    storage: result.storage,
+    paths: result.paths
+  }
+
+  for (const client of canvasEventClients) {
+    if (client.destroyed) {
+      canvasEventClients.delete(client)
+      continue
+    }
+
+    try {
+      sendCanvasEvent(client, payload)
+    } catch {
+      canvasEventClients.delete(client)
+    }
+  }
 }
 
 function readRequestBody(req) {
@@ -440,6 +470,32 @@ function canvasStoragePlugin() {
     configureServer(server) {
       server.middlewares.use(serveCanvasAsset)
 
+      server.middlewares.use('/api/canvas-events', (req, res) => {
+        if (req.method !== 'GET') {
+          res.statusCode = 405
+          res.setHeader('allow', 'GET')
+          res.end()
+          return
+        }
+
+        res.statusCode = 200
+        res.setHeader('content-type', 'text/event-stream')
+        res.setHeader('cache-control', 'no-cache, no-transform')
+        res.setHeader('connection', 'keep-alive')
+        res.setHeader('x-accel-buffering', 'no')
+        res.write(`: connected\n\n`)
+
+        canvasEventClients.add(res)
+        const heartbeat = setInterval(() => {
+          res.write(`: heartbeat ${Date.now()}\n\n`)
+        }, 25000)
+
+        req.on('close', () => {
+          clearInterval(heartbeat)
+          canvasEventClients.delete(res)
+        })
+      })
+
       server.middlewares.use('/api/selection', async (req, res) => {
         try {
           if (req.method === 'GET') {
@@ -547,6 +603,7 @@ function canvasStoragePlugin() {
 
             const result = await saveCanvasSnapshot(snapshot)
             sendJson(res, 200, { ok: true, ...result })
+            broadcastCanvasChanged(result)
             return
           }
 
