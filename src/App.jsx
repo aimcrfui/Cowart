@@ -763,7 +763,7 @@ export default function App() {
     let isSaving = false
     let hasPendingSave = false
     let hasUnsavedChanges = false
-    let isSyncingAnnotationLabelColor = false
+    let isSyncingAnnotationShape = false
     let remoteLoadController = null
 
     async function saveCanvas() {
@@ -874,37 +874,44 @@ export default function App() {
       }
     )
 
-    const unsubscribeAnnotationColorSync = editor.store.listen(
+    const unsubscribeAnnotationShapeSync = editor.store.listen(
       ({ changes }) => {
-        if (isSyncingAnnotationLabelColor) return
+        if (isSyncingAnnotationShape) return
 
         const updates = []
         for (const [_previous, next] of Object.values(changes.updated)) {
           if (next?.typeName !== 'shape') continue
           if (next.type !== 'arrow') continue
           if (next.meta?.cowartAnnotationArrow !== true) continue
-          if (next.props?.color === next.props?.labelColor) continue
+
+          const props = {}
+          if (next.props?.color !== next.props?.labelColor) {
+            props.labelColor = next.props.color
+          }
+          if (next.props?.labelPosition !== ANNOTATION_LABEL_POSITION) {
+            props.labelPosition = ANNOTATION_LABEL_POSITION
+          }
+
+          if (Object.keys(props).length === 0) continue
 
           updates.push({
             id: next.id,
             type: 'arrow',
-            props: {
-              labelColor: next.props.color
-            }
+            props
           })
         }
 
         if (updates.length === 0) return
 
-        isSyncingAnnotationLabelColor = true
+        isSyncingAnnotationShape = true
         try {
           editor.updateShapes(updates)
         } finally {
-          isSyncingAnnotationLabelColor = false
+          isSyncingAnnotationShape = false
         }
       },
       {
-        source: 'user',
+        source: 'all',
         scope: 'document'
       }
     )
@@ -923,7 +930,7 @@ export default function App() {
       document.getElementById(SELECTION_STATE_ELEMENT_ID)?.remove()
       unsubscribe()
       unsubscribeAnnotationEditingToolLock()
-      unsubscribeAnnotationColorSync()
+      unsubscribeAnnotationShapeSync()
       syncViewState()
       saveCanvas()
     }
