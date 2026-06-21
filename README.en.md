@@ -21,7 +21,8 @@ Send the following message to Codex:
 ```text
 Please install the Cowart Codex plugin from https://github.com/zhongerxin/cowart.git.
 Clone the repository into ~/plugins/cowart, verify that .codex-plugin/plugin.json exists,
-add the plugin to the personal marketplace, then run codex plugin add cowart@personal.
+add the plugin to the personal marketplace, run codex plugin marketplace add ~,
+then run codex plugin add cowart@personal.
 After installing, validate the plugin and tell me whether I should start a new conversation to load the new skills and MCP tools.
 ```
 
@@ -62,9 +63,10 @@ Make sure `~/.agents/plugins/marketplace.json` contains a Cowart entry:
 }
 ```
 
-Then install the plugin:
+Then register the personal marketplace and install the plugin:
 
 ```bash
+codex plugin marketplace add ~
 codex plugin add cowart@personal
 ```
 
