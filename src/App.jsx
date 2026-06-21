@@ -79,6 +79,23 @@ function recordsAreEqual(left, right) {
   return JSON.stringify(left) === JSON.stringify(right)
 }
 
+function storeChangedSinceSnapshot(editor, baselineStore) {
+  const currentStore = editor.store.getStoreSnapshot().store
+  const baselineIds = new Set(Object.keys(baselineStore))
+
+  for (const [id, baselineRecord] of Object.entries(baselineStore)) {
+    const currentRecord = currentStore[id]
+    if (!currentRecord) return true
+    if (!recordsAreEqual(currentRecord, baselineRecord)) return true
+  }
+
+  for (const id of Object.keys(currentStore)) {
+    if (!baselineIds.has(id)) return true
+  }
+
+  return false
+}
+
 function applyRemoteCanvasSnapshot(editor, snapshot, { preserveLocalChanges = false } = {}) {
   if (!isCanvasSnapshot(snapshot)) return 0
 
@@ -844,7 +861,9 @@ export default function App() {
       remoteLoadController?.abort()
       const controller = new AbortController()
       remoteLoadController = controller
+
       const preserveLocalChanges = hasUnsavedChanges || isSaving
+      const preFetchStore = preserveLocalChanges ? null : editor.store.getStoreSnapshot().store
 
       try {
         const response = await fetch(CANVAS_ENDPOINT, { signal: controller.signal })
@@ -853,11 +872,13 @@ export default function App() {
         }
 
         const canvasData = await response.json()
+        const effectivePreserve =
+          preserveLocalChanges || (preFetchStore && storeChangedSinceSnapshot(editor, preFetchStore))
         const changedRecords = applyRemoteCanvasSnapshot(editor, canvasData.snapshot, {
-          preserveLocalChanges
+          preserveLocalChanges: effectivePreserve
         })
 
-        if (changedRecords > 0 && preserveLocalChanges) {
+        if (changedRecords > 0 && effectivePreserve) {
           hasUnsavedChanges = true
           if (isSaving) {
             hasPendingSave = true

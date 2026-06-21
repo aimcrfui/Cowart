@@ -276,7 +276,7 @@ async function localizePageAsset(asset, pageId) {
   if (!dataUrl && !sourceFilePath) return localizedAsset
 
   const fileName = sanitizeAssetFileName(
-    localizedAsset.props.name,
+    dataUrl ? null : localizedAsset.props.name,
     sourceFilePath ? basename(sourceFilePath) : localizedAsset.id.replace(':', '-'),
     dataUrl?.mimeType ?? localizedAsset.props.mimeType
   )
