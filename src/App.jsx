@@ -55,6 +55,7 @@ import { getAssetUrlsByImport } from '@tldraw/assets/imports.vite'
 import { AllSelection } from '@tiptap/pm/state'
 import 'tldraw/tldraw.css'
 import { useCallback, useEffect, useRef, useState } from 'react'
+import aiFrameToolIconRaw from './assets/ai-frame.svg?raw'
 import annotationToolIconRaw from './assets/tool-comment.svg?raw'
 import {
   IS_COWART_WIDGET_BUILD,
@@ -129,6 +130,14 @@ const AI_IMAGE_GENERATION_PROMPT_PREFIX = [
   '如果附带一张或多张参考图，请把参考图作为视觉参考；不要把参考图文件名或任何界面元素画进最终图片。',
   '不需要选择生图模型，使用 Codex 当前可用的图片生成能力。'
 ].join('\n')
+const aiFrameToolIconSvg = aiFrameToolIconRaw.replaceAll('black', 'currentColor')
+const aiFrameToolIcon = (
+  <div
+    aria-hidden="true"
+    className="cowart-ai-frame-tool-icon"
+    dangerouslySetInnerHTML={{ __html: aiFrameToolIconSvg }}
+  />
+)
 const annotationToolIconSvg = annotationToolIconRaw.replaceAll('black', 'currentColor')
 const annotationToolIcon = (
   <div
@@ -1027,7 +1036,7 @@ const cowartUiOverrides = {
       [AI_IMAGE_TOOL_ID]: {
         id: AI_IMAGE_TOOL_ID,
         label: 'tool.ai-image',
-        icon: 'tool-frame',
+        icon: aiFrameToolIcon,
         kbd: 'a',
         onSelect() {
           createAiImageHolderAtViewportCenter(editor)
@@ -1274,7 +1283,7 @@ function CowartAiImageGenerationPanel() {
             }
           }}
           onKeyDown={handlePromptKeyDown}
-          placeholder="今天我们要创作什么"
+          placeholder="描述你想生成的图片"
           rows={3}
           value={promptValue}
         />

@@ -150,6 +150,23 @@ body {
   height: 100%;
 }
 
+.cowart-ai-frame-tool-icon {
+  display: grid;
+  flex: 0 0 auto;
+  position: relative;
+  z-index: 1;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  color: currentColor;
+}
+
+.cowart-ai-frame-tool-icon svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
 .cowart-annotation-edit-toolbar-button[data-status="sending"] {
   opacity: 0.65;
 }
@@ -352,7 +369,7 @@ body {
   color: #1f2430;
   background: rgb(255 255 255 / 96%);
   border: 1px solid #d5dbe5;
-  border-radius: 24px;
+  border-radius: 18px;
   box-shadow:
     0 30px 74px rgb(15 23 42 / 10%),
     0 10px 30px rgb(15 23 42 / 8%),
@@ -546,6 +563,6 @@ body {
     min-width: min(320px, calc(100vw - 32px));
     height: 214px;
     padding: 14px;
-    border-radius: 22px;
+    border-radius: 18px;
   }
 }
