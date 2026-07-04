@@ -5,8 +5,11 @@ import {
   ArrowToolbarItem,
   ArrowUpToolbarItem,
   AssetToolbarItem,
+  Box,
   CheckBoxToolbarItem,
   CloudToolbarItem,
+  DefaultImageToolbar,
+  DefaultImageToolbarContent,
   DefaultToolbar,
   DefaultColorStyle,
   DefaultStylePanel,
@@ -32,7 +35,11 @@ import {
   StarToolbarItem,
   TextToolbarItem,
   Tldraw,
+  TldrawUiButton,
+  TldrawUiButtonIcon,
+  TldrawUiInput,
   TldrawUiMenuToolItem,
+  TldrawUiToolbarButton,
   TriangleToolbarItem,
   XBoxToolbarItem,
   createShapeId,
@@ -40,12 +47,14 @@ import {
   startEditingShapeWithRichText,
   toRichText,
   useEditor,
+  useTranslation,
+  useUiEvents,
   useValue
 } from 'tldraw'
 import { getAssetUrlsByImport } from '@tldraw/assets/imports.vite'
 import { AllSelection } from '@tiptap/pm/state'
 import 'tldraw/tldraw.css'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import annotationToolIconRaw from './assets/tool-comment.svg?raw'
 import {
   IS_COWART_WIDGET_BUILD,
@@ -89,6 +98,22 @@ const ANNOTATION_MAX_BEND = 48
 const ANNOTATION_LABEL_POSITION = 0
 const ANNOTATION_SELECT_TEXT_MAX_ATTEMPTS = 8
 const ANNOTATION_SELECT_TEXT_SETTLE_ATTEMPTS = 4
+const ANNOTATION_EDIT_TOOL_LABEL = '按标注修改'
+const ANNOTATION_EDIT_PROMPT = [
+  '[@cowart](plugin://cowart@personal) 按标注修改',
+  '',
+  '请根据这张 Cowart 截图里的标注修改当前选中的图片：',
+  '- 截图包含当前图片，以及连到图片里或图片附近的标注箭头和标注文字。',
+  '- 请把标注文字当作修改要求，生成一张新的干净图片。',
+  '- 不要把标注箭头、标注文字、蓝色选框或工具栏带进最终图片。',
+  '- 保留原图和原标注不动，把新图放到原图旁边。'
+].join('\n')
+const ANNOTATION_EDIT_EXPORT_PADDING = 32
+const ANNOTATION_EDIT_NEAR_MARGIN_MIN = 160
+const ANNOTATION_EDIT_NEAR_MARGIN_MAX = 720
+const ANNOTATION_EDIT_RELATED_TEXT_MARGIN = 120
+const ANNOTATION_EDIT_STATUS_RESET_MS = 2200
+const ANNOTATION_EDIT_COLORS = new Set(['red', 'yellow', 'orange'])
 const annotationToolIconSvg = annotationToolIconRaw.replaceAll('black', 'currentColor')
 const annotationToolIcon = (
   <div
@@ -174,6 +199,10 @@ function getAiImageHolderMeta() {
 
 function isAiImageHolderShape(shape) {
   return shape?.type === 'frame' && shape.meta?.cowartAiImageHolder === true
+}
+
+function isImageShape(shape) {
+  return shape?.type === 'image'
 }
 
 function isAiImageAspectLocked(shape) {
@@ -393,6 +422,167 @@ function getDefaultAnnotationArrowBend(dx, dy, scale) {
 function getAnnotationColor(editor) {
   const color = editor.getStyleForNextShape(DefaultColorStyle)
   return color === DefaultColorStyle.defaultValue ? ANNOTATION_DEFAULT_COLOR : color
+}
+
+function expandBox(bounds, padding) {
+  return new Box(
+    bounds.x - padding,
+    bounds.y - padding,
+    bounds.w + padding * 2,
+    bounds.h + padding * 2
+  )
+}
+
+function annotationEditNearMargin(imageBounds) {
+  return Math.min(
+    ANNOTATION_EDIT_NEAR_MARGIN_MAX,
+    Math.max(ANNOTATION_EDIT_NEAR_MARGIN_MIN, Math.max(imageBounds.w, imageBounds.h))
+  )
+}
+
+function shapeHasAnnotationColor(shape) {
+  const color = shape?.props?.color
+  const labelColor = shape?.props?.labelColor
+  return ANNOTATION_EDIT_COLORS.has(color) || ANNOTATION_EDIT_COLORS.has(labelColor)
+}
+
+function isAnnotationArrowShape(shape) {
+  return shape?.type === 'arrow' && (shape.meta?.cowartAnnotationArrow === true || shapeHasAnnotationColor(shape))
+}
+
+function isAnnotationTextShape(shape) {
+  return shape?.type === 'text' && (shape.meta?.cowartAnnotationText === true || shapeHasAnnotationColor(shape))
+}
+
+function uniqueShapeIds(shapeIds) {
+  return Array.from(new Set(shapeIds.filter(Boolean)))
+}
+
+function collectAnnotationEditShapeIds(editor, imageShapeId) {
+  const imageShape = editor.getShape(imageShapeId)
+  if (!isImageShape(imageShape)) {
+    throw new Error('请选择一张图片后再按标注修改。')
+  }
+
+  const imageBounds = editor.getShapePageBounds(imageShapeId)
+  if (!imageBounds) {
+    throw new Error('无法读取当前图片的画布位置。')
+  }
+
+  const nearBounds = expandBox(imageBounds, annotationEditNearMargin(imageBounds))
+  const relatedArrowIds = []
+  const relatedArrowBounds = []
+  const relatedTextIds = []
+
+  for (const shape of editor.getCurrentPageShapesSorted()) {
+    if (!shape || shape.id === imageShapeId) continue
+
+    const bounds = editor.getShapePageBounds(shape)
+    if (!bounds) continue
+
+    if (isAnnotationArrowShape(shape) && nearBounds.collides(bounds)) {
+      relatedArrowIds.push(shape.id)
+      relatedArrowBounds.push(bounds)
+      continue
+    }
+
+    if (!isAnnotationTextShape(shape)) continue
+
+    if (nearBounds.collides(bounds)) {
+      relatedTextIds.push(shape.id)
+      continue
+    }
+
+    if (
+      relatedArrowBounds.some((arrowBounds) =>
+        expandBox(arrowBounds, ANNOTATION_EDIT_RELATED_TEXT_MARGIN).collides(bounds)
+      )
+    ) {
+      relatedTextIds.push(shape.id)
+    }
+  }
+
+  return uniqueShapeIds([imageShapeId, ...relatedArrowIds, ...relatedTextIds])
+}
+
+function buildAnnotationEditPrompt({ imageShapeId, shapeIds, exportWidth, exportHeight }) {
+  const annotationCount = Math.max(0, shapeIds.length - 1)
+  return [
+    ANNOTATION_EDIT_PROMPT,
+    '',
+    `Cowart source image shape: ${imageShapeId}`,
+    `Included annotation shapes: ${annotationCount}`,
+    `Screenshot size: ${Math.round(exportWidth)}x${Math.round(exportHeight)}`
+  ].join('\n')
+}
+
+function getAnnotationEditExportPixelRatio(bounds) {
+  const maxDimension = Math.max(bounds.w, bounds.h)
+  if (maxDimension > 1600) return 1
+  if (maxDimension > 1000) return 1.5
+  return 2
+}
+
+function dataUrlToImageContent(dataUrl, meta = {}) {
+  const match = String(dataUrl).match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/)
+  if (!match) {
+    throw new Error('导出的截图不是有效的图片 data URL。')
+  }
+
+  return {
+    type: 'image',
+    data: match[2],
+    mimeType: match[1],
+    _meta: meta
+  }
+}
+
+function followUpSender() {
+  if (typeof window.cowartMcp?.sendFollowUpMessage === 'function') {
+    return (message) => window.cowartMcp.sendFollowUpMessage(message)
+  }
+  if (typeof window.openai?.sendFollowUpMessage === 'function') {
+    return (message) => window.openai.sendFollowUpMessage(message)
+  }
+  return null
+}
+
+async function sendAnnotationEditRequest(editor, imageShapeId) {
+  const shapeIds = collectAnnotationEditShapeIds(editor, imageShapeId)
+  const rawBounds = editor.getShapesPageBounds(shapeIds)
+  if (!rawBounds) throw new Error('无法计算截图范围。')
+
+  const exportBounds = expandBox(rawBounds, ANNOTATION_EDIT_EXPORT_PADDING)
+  const exportResult = await editor.toImageDataUrl(shapeIds, {
+    bounds: exportBounds,
+    background: true,
+    darkMode: false,
+    format: 'png',
+    padding: 0,
+    pixelRatio: getAnnotationEditExportPixelRatio(exportBounds)
+  })
+  const prompt = buildAnnotationEditPrompt({
+    imageShapeId,
+    shapeIds,
+    exportWidth: exportResult.width,
+    exportHeight: exportResult.height
+  })
+  const sender = followUpSender()
+  if (!sender) {
+    throw new Error('当前 Cowart 画布没有可用的 Codex MCP 消息桥。')
+  }
+
+  return sender({
+    prompt,
+    content: [
+      { type: 'text', text: prompt },
+      dataUrlToImageContent(exportResult.url, {
+        cowartAnnotationEdit: true,
+        cowartSourceImageShapeId: imageShapeId,
+        cowartIncludedShapeIds: shapeIds
+      })
+    ]
+  })
 }
 
 class CowartAnnotationTool extends StateNode {
@@ -617,6 +807,7 @@ const cowartUiOverrides = {
 
 const cowartComponents = {
   Toolbar: CowartToolbar,
+  ImageToolbar: CowartImageToolbar,
   StylePanel: CowartStylePanel
 }
 
@@ -828,6 +1019,198 @@ function CowartAspectLockIcon({ locked }) {
       <rect x="4.5" y="8.5" width="11" height="8" rx="2" />
       <path d="M7 8.5V6.5a3 3 0 0 1 5.8-1.1" />
     </svg>
+  )
+}
+
+function CowartImageToolbar() {
+  return (
+    <DefaultImageToolbar>
+      <CowartImageToolbarContent />
+    </DefaultImageToolbar>
+  )
+}
+
+function CowartImageToolbarContent() {
+  const editor = useEditor()
+  const imageShapeId = useValue(
+    'cowart selected image shape id',
+    () => {
+      const shape = editor.getOnlySelectedShape()
+      return isImageShape(shape) ? shape.id : null
+    },
+    [editor]
+  )
+  const isInCropTool = useValue('cowart image crop tool state', () => editor.isIn('select.crop.'), [
+    editor
+  ])
+  const [isEditingAltText, setIsEditingAltText] = useState(false)
+
+  const handleManipulatingEnd = useCallback(() => {
+    editor.setCroppingShape(null)
+    editor.setCurrentTool('select.idle')
+  }, [editor])
+  const handleManipulatingStart = useCallback(() => editor.setCurrentTool('select.crop.idle'), [editor])
+  const handleEditAltTextStart = useCallback(() => setIsEditingAltText(true), [])
+  const handleEditAltTextClose = useCallback(() => setIsEditingAltText(false), [])
+
+  useEffect(() => {
+    setIsEditingAltText(false)
+  }, [imageShapeId])
+
+  if (!imageShapeId) return null
+
+  if (isEditingAltText) {
+    return (
+      <CowartAltTextEditor
+        onClose={handleEditAltTextClose}
+        shapeId={imageShapeId}
+      />
+    )
+  }
+
+  return (
+    <>
+      <DefaultImageToolbarContent
+        imageShapeId={imageShapeId}
+        isManipulating={isInCropTool}
+        onEditAltTextStart={handleEditAltTextStart}
+        onManipulatingEnd={handleManipulatingEnd}
+        onManipulatingStart={handleManipulatingStart}
+      />
+      {!isInCropTool && <CowartAnnotationEditToolbarButton imageShapeId={imageShapeId} />}
+    </>
+  )
+}
+
+function CowartAltTextEditor({ shapeId, onClose }) {
+  const editor = useEditor()
+  const msg = useTranslation()
+  const trackEvent = useUiEvents()
+  const inputRef = useRef(null)
+  const isReadonly = editor.getIsReadonly()
+  const [altText, setAltText] = useState(() => {
+    const shape = editor.getShape(shapeId)
+    return typeof shape?.props?.altText === 'string' ? shape.props.altText : ''
+  })
+
+  const handleComplete = useCallback(() => {
+    trackEvent('set-alt-text', { source: 'image-toolbar' })
+    const shape = editor.getShape(shapeId)
+    if (shape && 'altText' in shape.props) {
+      editor.updateShapes([
+        {
+          id: shape.id,
+          type: shape.type,
+          props: { altText }
+        }
+      ])
+    }
+    onClose()
+  }, [altText, editor, onClose, shapeId, trackEvent])
+
+  useEffect(() => {
+    inputRef.current?.select()
+
+    function handleKeyDown(event) {
+      if (event.key !== 'Escape') return
+      event.stopPropagation()
+      onClose()
+    }
+
+    const doc = editor.getContainerDocument()
+    doc.addEventListener('keydown', handleKeyDown, { capture: true })
+    return () => doc.removeEventListener('keydown', handleKeyDown, { capture: true })
+  }, [editor, inputRef, onClose])
+
+  useEffect(() => {
+    function handlePointerDown(event) {
+      const toolbar = editor.getContainerDocument().querySelector('.tlui-media__toolbar')
+      if (toolbar?.contains(event.target)) return
+      handleComplete()
+    }
+
+    const doc = editor.getContainerDocument()
+    doc.addEventListener('pointerdown', handlePointerDown, { capture: true })
+    return () => doc.removeEventListener('pointerdown', handlePointerDown, { capture: true })
+  }, [editor, handleComplete])
+
+  return (
+    <>
+      <TldrawUiInput
+        ref={inputRef}
+        aria-label={msg('tool.media-alt-text-desc')}
+        className="tlui-media__toolbar-alt-text-input"
+        data-testid="media-toolbar.alt-text-input"
+        disabled={isReadonly}
+        onCancel={onClose}
+        onComplete={handleComplete}
+        onValueChange={setAltText}
+        placeholder={msg('tool.media-alt-text-desc')}
+        value={altText}
+      />
+      {!isReadonly && (
+        <TldrawUiButton
+          data-testid="tool.media-alt-text-confirm"
+          onClick={handleComplete}
+          onPointerDown={(event) => event.preventDefault()}
+          title={msg('tool.media-alt-text-confirm')}
+          type="icon"
+        >
+          <TldrawUiButtonIcon icon="check" small />
+        </TldrawUiButton>
+      )}
+    </>
+  )
+}
+
+function CowartAnnotationEditToolbarButton({ imageShapeId }) {
+  const editor = useEditor()
+  const [status, setStatus] = useState('idle')
+
+  useEffect(() => {
+    if (status === 'idle' || status === 'sending') return
+    const timer = window.setTimeout(() => setStatus('idle'), ANNOTATION_EDIT_STATUS_RESET_MS)
+    return () => window.clearTimeout(timer)
+  }, [status])
+
+  async function handleClick() {
+    if (status === 'sending') return
+
+    setStatus('sending')
+    try {
+      await sendAnnotationEditRequest(editor, imageShapeId)
+      setStatus('sent')
+    } catch (error) {
+      console.error(error)
+      setStatus('error')
+    }
+  }
+
+  const title =
+    status === 'sending'
+      ? '正在提交标注修改'
+      : status === 'sent'
+        ? '已提交标注修改'
+        : status === 'error'
+          ? '提交失败，请重试'
+          : ANNOTATION_EDIT_TOOL_LABEL
+
+  return (
+    <TldrawUiToolbarButton
+      aria-label={title}
+      className="cowart-annotation-edit-toolbar-button"
+      data-status={status}
+      data-testid="tool.cowart-annotation-edit"
+      disabled={status === 'sending'}
+      onClick={handleClick}
+      title={title}
+      type="icon"
+    >
+      <TldrawUiButtonIcon
+        icon={status === 'sent' ? 'check' : status === 'error' ? 'warning-triangle' : 'comment'}
+        small
+      />
+    </TldrawUiToolbarButton>
   )
 }
 

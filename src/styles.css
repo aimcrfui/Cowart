@@ -150,6 +150,18 @@ body {
   height: 100%;
 }
 
+.cowart-annotation-edit-toolbar-button[data-status="sending"] {
+  opacity: 0.65;
+}
+
+.cowart-annotation-edit-toolbar-button[data-status="sent"] {
+  color: #1f8f4d;
+}
+
+.cowart-annotation-edit-toolbar-button[data-status="error"] {
+  color: #c2410c;
+}
+
 .tlui-style-panel.tlui-style-panel__wrapper:has(.cowart-ai-image-style-panel) {
   width: min(240px, calc(100vw - 24px)) !important;
   max-width: min(240px, calc(100vw - 24px)) !important;
