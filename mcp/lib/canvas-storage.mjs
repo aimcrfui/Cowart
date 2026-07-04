@@ -235,6 +235,26 @@ function sanitizeAssetFileName(name, fallbackName, mimeType) {
   return `${baseName || "asset"}${extension}`;
 }
 
+async function uniqueAssetFilePath(dir, requestedName) {
+  const safeName = sanitizeAssetFileName(requestedName, "asset", null);
+  const extension = extname(safeName);
+  const baseName = safeName.slice(0, safeName.length - extension.length);
+  let fileName = safeName;
+  let counter = 2;
+
+  while (true) {
+    const filePath = join(dir, fileName);
+    try {
+      await stat(filePath);
+      fileName = `${baseName}-v${counter}${extension}`;
+      counter += 1;
+    } catch (error) {
+      if (error?.code === "ENOENT") return { fileName, filePath };
+      throw error;
+    }
+  }
+}
+
 function parseDataUrl(src) {
   const match = /^data:([^;,]+)?(?:;[^,]*)?,(.*)$/s.exec(src);
   if (!match) return null;
@@ -265,6 +285,64 @@ function localAssetFilePathFromUrl(src, args = {}) {
   const requestedPath = decodeURIComponent(src.slice(route.length));
   const filePath = resolve(baseDir, requestedPath);
   return isSafeChildPath(baseDir, filePath) ? filePath : null;
+}
+
+function stringSet(value) {
+  return new Set(Array.isArray(value) ? value.filter((item) => typeof item === "string") : []);
+}
+
+function getImageShapeRefs(snapshot) {
+  if (!isCanvasSnapshot(snapshot)) return [];
+
+  const refs = [];
+  for (const page of getPageRecords(snapshot)) {
+    for (const shape of getShapeRecordsForPage(snapshot, page.id)) {
+      if (shape?.typeName !== "shape" || shape.type !== "image") continue;
+
+      const assetId = typeof shape.props?.assetId === "string" ? shape.props.assetId : null;
+      const asset = assetId ? snapshot.store[assetId] : null;
+      refs.push({
+        pageId: page.id,
+        shapeId: shape.id,
+        assetId,
+        assetSrc: typeof asset?.props?.src === "string" ? asset.props.src : null,
+        assetName: typeof asset?.props?.name === "string" ? asset.props.name : null,
+      });
+    }
+  }
+  return refs;
+}
+
+async function hasRecoverableImagePayload(args, imageRef) {
+  if (typeof imageRef.assetSrc !== "string") return false;
+  if (imageRef.assetSrc.startsWith("data:")) return true;
+
+  const filePath = localAssetFilePathFromUrl(imageRef.assetSrc, args);
+  if (!filePath) return false;
+
+  try {
+    return (await stat(filePath)).isFile();
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function getUnacknowledgedImageLosses(args, previousSnapshot, nextSnapshot) {
+  if (!args.protectImageRecords) return [];
+
+  const acknowledgedDeletes = stringSet(args.acknowledgedImageShapeDeletes);
+  const nextImageShapeIds = new Set(getImageShapeRefs(nextSnapshot).map((ref) => ref.shapeId));
+  const losses = [];
+
+  for (const imageRef of getImageShapeRefs(previousSnapshot)) {
+    if (nextImageShapeIds.has(imageRef.shapeId)) continue;
+    if (acknowledgedDeletes.has(imageRef.shapeId)) continue;
+    if (!(await hasRecoverableImagePayload(args, imageRef))) continue;
+    losses.push(imageRef);
+  }
+
+  return losses;
 }
 
 async function localizePageAsset(args, asset, pageId) {
@@ -441,6 +519,57 @@ async function hydrateSnapshotAssets(args, snapshot) {
   return { snapshot: hydrated, hydratedAssets };
 }
 
+export async function writeCowartPageAsset(args = {}, options = {}) {
+  const pageId = nonEmptyString(options.pageId);
+  if (!pageId) throw new Error("pageId is required to save a Cowart page asset.");
+
+  const dataUrl = nonEmptyString(options.dataUrl);
+  const dataBase64 = nonEmptyString(options.dataBase64);
+  let parsed = null;
+  if (dataUrl) {
+    parsed = parseDataUrl(dataUrl);
+  } else if (dataBase64) {
+    parsed = {
+      buffer: Buffer.from(dataBase64, "base64"),
+      mimeType: nonEmptyString(options.mimeType) || "application/octet-stream",
+    };
+  }
+  if (!parsed?.buffer?.length) {
+    throw new Error("Expected a non-empty dataUrl or dataBase64 image payload.");
+  }
+
+  const mimeType = nonEmptyString(options.mimeType) || parsed.mimeType || "application/octet-stream";
+  if (!mimeType.startsWith("image/")) {
+    throw new Error(`Cowart page assets only accept image payloads. Received ${mimeType}.`);
+  }
+
+  const canvasDir = resolveCanvasDir(args);
+  const destinationDir = pageAssetsDir(args, pageId);
+  if (!isSafeChildPath(canvasDir, destinationDir)) {
+    throw new Error(`Unsafe Cowart page assets directory: ${destinationDir}`);
+  }
+
+  const requestedName = sanitizeAssetFileName(
+    options.fileName,
+    `reference-${Date.now()}`,
+    mimeType,
+  );
+  const { fileName, filePath } = await uniqueAssetFilePath(destinationDir, requestedName);
+  await mkdir(destinationDir, { recursive: true });
+  await writeFile(filePath, parsed.buffer);
+
+  return {
+    ok: true,
+    canvasDir,
+    pageId,
+    fileName,
+    assetPath: filePath,
+    assetUrl: pageAssetUrl(pageId, fileName),
+    mimeType,
+    fileSize: parsed.buffer.length,
+  };
+}
+
 export async function readCowartCanvasState(args = {}, { hydrateAssets = true } = {}) {
   const { projectDir, canvasDir } = resolveCowartPaths(args);
   const loaded = await loadStoredCanvasSnapshot(args);
@@ -472,6 +601,19 @@ export async function saveCowartCanvasSnapshot(args = {}, snapshot) {
       storage: "invalid",
       paths: [],
       skippedRecords: sanitized.skippedRecords,
+    };
+  }
+
+  const previous = await loadStoredCanvasSnapshot(args);
+  const imageLosses = await getUnacknowledgedImageLosses(args, previous.snapshot, sanitized.snapshot);
+  if (imageLosses.length > 0) {
+    return {
+      ok: false,
+      storage: "blocked-destructive-image-loss",
+      paths: [],
+      skippedRecords: sanitized.skippedRecords,
+      blockedImageLosses: imageLosses,
+      message: `Cowart refused to save because ${imageLosses.length} existing image shape(s) disappeared without a user delete confirmation.`,
     };
   }
 

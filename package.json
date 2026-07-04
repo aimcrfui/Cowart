@@ -1,6 +1,6 @@
 {
   "name": "cowart-canvas",
-  "version": "0.1.4",
+  "version": "0.1.10",
   "private": true,
   "type": "module",
   "scripts": {

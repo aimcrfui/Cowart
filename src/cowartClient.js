@@ -6,6 +6,8 @@ const TOOL_GET_CANVAS_STATE = 'get_cowart_canvas_state'
 const TOOL_SAVE_CANVAS_STATE = 'save_cowart_canvas_state'
 const TOOL_SAVE_SELECTION_STATE = 'save_cowart_selection_state'
 const TOOL_SAVE_VIEW_STATE = 'save_cowart_view_state'
+const TOOL_SAVE_REFERENCE_IMAGE = 'save_cowart_reference_image'
+const WIDGET_PAYLOAD_TIMEOUT_MS = 5000
 
 globalThis.__COWART_WIDGET_FETCH_GUARD__ = true
 
@@ -20,6 +22,11 @@ function currentWidgetPayload() {
   return window.openai?.toolOutput && typeof window.openai.toolOutput === 'object'
     ? window.openai.toolOutput
     : {}
+}
+
+function hasWidgetStorageTarget() {
+  const payload = currentWidgetPayload()
+  return Boolean(payload.projectDir || payload.canvasDir)
 }
 
 function serverToolArgs(extra = {}) {
@@ -41,8 +48,7 @@ function abortError() {
 
 async function waitForWidgetPayload(signal) {
   if (!hasCowartWidgetBridge()) return
-  const payload = currentWidgetPayload()
-  if (payload.projectDir || payload.canvasDir) return
+  if (hasWidgetStorageTarget()) return
 
   await new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -50,7 +56,10 @@ async function waitForWidgetPayload(signal) {
       return
     }
 
-    const timer = window.setTimeout(resolve, 1500)
+    const timer = window.setTimeout(() => {
+      cleanup()
+      reject(new Error('Cowart widget storage target was not ready. Refusing to read or write without projectDir/canvasDir.'))
+    }, WIDGET_PAYLOAD_TIMEOUT_MS)
     const cleanup = () => {
       window.clearTimeout(timer)
       window.removeEventListener('openai:set_globals', handleGlobals)
@@ -60,7 +69,9 @@ async function waitForWidgetPayload(signal) {
       cleanup()
       resolve()
     }
-    const handleGlobals = () => finish()
+    const handleGlobals = () => {
+      if (hasWidgetStorageTarget()) finish()
+    }
     const handleAbort = () => {
       cleanup()
       reject(abortError())
@@ -134,9 +145,13 @@ export async function refreshCowartCanvasSnapshot(signal) {
   return canvasData.snapshot
 }
 
-export async function saveCowartCanvasSnapshot(snapshot) {
+export async function saveCowartCanvasSnapshot(snapshot, options = {}) {
   if (hasCowartWidgetBridge()) {
-    return callCowartServerTool(TOOL_SAVE_CANVAS_STATE, { snapshot })
+    return callCowartServerTool(TOOL_SAVE_CANVAS_STATE, {
+      snapshot,
+      protectImageRecords: options.protectImageRecords,
+      acknowledgedImageShapeDeletes: options.acknowledgedImageShapeDeletes
+    })
   }
 
   return fetchJson(CANVAS_ENDPOINT, {
@@ -168,4 +183,12 @@ export async function saveCowartViewState(viewState) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(viewState)
   })
+}
+
+export async function saveCowartReferenceImage(reference) {
+  if (!hasCowartWidgetBridge()) {
+    throw new Error('当前 Cowart 画布没有可用的 Codex MCP 文件保存桥。')
+  }
+
+  return callCowartServerTool(TOOL_SAVE_REFERENCE_IMAGE, reference)
 }

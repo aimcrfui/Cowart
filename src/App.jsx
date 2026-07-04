@@ -62,6 +62,7 @@ import {
   loadCowartCanvasState,
   refreshCowartCanvasSnapshot,
   saveCowartCanvasSnapshot,
+  saveCowartReferenceImage,
   saveCowartSelectionState,
   saveCowartViewState
 } from './cowartClient.js'
@@ -78,6 +79,13 @@ const AI_IMAGE_HOLDER_DEFAULT_W = 512
 const AI_IMAGE_HOLDER_DEFAULT_H = 683
 const AI_IMAGE_SIZE_MIN = 16
 const AI_IMAGE_SIZE_MAX = 8192
+const AI_IMAGE_GENERATION_PANEL_OFFSET = 14
+const AI_IMAGE_GENERATION_PANEL_MIN_W = 520
+const AI_IMAGE_GENERATION_PANEL_MAX_W = 640
+const AI_IMAGE_GENERATION_PANEL_VIEWPORT_MARGIN = 16
+const AI_IMAGE_GENERATION_PANEL_ESTIMATED_H = 226
+const AI_IMAGE_GENERATION_STATUS_RESET_MS = 2200
+const AI_IMAGE_REFERENCE_MAX_FILES = 10
 const SKIPPED_RECORDS_NOTICE_AUTO_HIDE_MS = 5000
 const AI_IMAGE_ASPECT_PRESETS = [
   { id: '1-1', label: '1:1', w: 512, h: 512 },
@@ -114,6 +122,13 @@ const ANNOTATION_EDIT_NEAR_MARGIN_MAX = 720
 const ANNOTATION_EDIT_RELATED_TEXT_MARGIN = 120
 const ANNOTATION_EDIT_STATUS_RESET_MS = 2200
 const ANNOTATION_EDIT_COLORS = new Set(['red', 'yellow', 'orange'])
+const AI_IMAGE_GENERATION_PROMPT_PREFIX = [
+  '[@cowart](plugin://cowart@personal) 生成图片',
+  '',
+  '请根据下面的 prompt 生成一张图片，并填入当前选中的 Cowart AI 图片框。',
+  '如果附带一张或多张参考图，请把参考图作为视觉参考；不要把参考图文件名或任何界面元素画进最终图片。',
+  '不需要选择生图模型，使用 Codex 当前可用的图片生成能力。'
+].join('\n')
 const annotationToolIconSvg = annotationToolIconRaw.replaceAll('black', 'currentColor')
 const annotationToolIcon = (
   <div
@@ -133,7 +148,12 @@ function buildCowartAssetUrls() {
     const name = path.split('/').pop().replace(/\.svg$/, '')
     icons[name] = `data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(source)))}`
   }
-  const base = getAssetUrlsByImport()
+  let base = {}
+  try {
+    base = getAssetUrlsByImport()
+  } catch (error) {
+    console.warn('Cowart could not load bundled tldraw asset URLs.', error)
+  }
   return { ...base, icons: { ...base.icons, ...icons } }
 }
 
@@ -203,6 +223,22 @@ function isAiImageHolderShape(shape) {
 
 function isImageShape(shape) {
   return shape?.type === 'image'
+}
+
+function isImageShapeRecord(record) {
+  return record?.typeName === 'shape' && record.type === 'image'
+}
+
+function recordValues(records) {
+  return Object.values(records || {})
+}
+
+function collectRemovedImageShapeIds(changes) {
+  const imageShapeIds = []
+  for (const removedRecord of recordValues(changes?.removed)) {
+    if (isImageShapeRecord(removedRecord)) imageShapeIds.push(removedRecord.id)
+  }
+  return imageShapeIds
 }
 
 function isAiImageAspectLocked(shape) {
@@ -505,15 +541,24 @@ function collectAnnotationEditShapeIds(editor, imageShapeId) {
   return uniqueShapeIds([imageShapeId, ...relatedArrowIds, ...relatedTextIds])
 }
 
-function buildAnnotationEditPrompt({ imageShapeId, shapeIds, exportWidth, exportHeight }) {
+function buildAnnotationEditPrompt({ imageShapeId, shapeIds, exportWidth, exportHeight, screenshotAsset }) {
   const annotationCount = Math.max(0, shapeIds.length - 1)
-  return [
+  const lines = [
     ANNOTATION_EDIT_PROMPT,
     '',
     `Cowart source image shape: ${imageShapeId}`,
     `Included annotation shapes: ${annotationCount}`,
     `Screenshot size: ${Math.round(exportWidth)}x${Math.round(exportHeight)}`
-  ].join('\n')
+  ]
+
+  if (screenshotAsset?.assetPath) {
+    lines.push(
+      `Annotation screenshot local path: ${screenshotAsset.assetPath}`,
+      'Use this local screenshot file as the authoritative visual reference for the requested edits.'
+    )
+  }
+
+  return lines.join('\n')
 }
 
 function getAnnotationEditExportPixelRatio(bounds) {
@@ -521,6 +566,11 @@ function getAnnotationEditExportPixelRatio(bounds) {
   if (maxDimension > 1600) return 1
   if (maxDimension > 1000) return 1.5
   return 2
+}
+
+function annotationEditScreenshotFileName() {
+  const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')
+  return `annotation-edit-${timestamp}.png`
 }
 
 function dataUrlToImageContent(dataUrl, meta = {}) {
@@ -547,6 +597,23 @@ function followUpSender() {
   return null
 }
 
+function cowartHostCapabilities() {
+  try {
+    return (
+      window.cowartMcp?.getHostCapabilities?.() ||
+      window.openai?.hostCapabilities ||
+      globalThis.__COWART_MCP_APP__?.getHostCapabilities?.() ||
+      null
+    )
+  } catch (_error) {
+    return null
+  }
+}
+
+function supportsCowartMessageImages() {
+  return Boolean(cowartHostCapabilities()?.message?.image)
+}
+
 async function sendAnnotationEditRequest(editor, imageShapeId) {
   const shapeIds = collectAnnotationEditShapeIds(editor, imageShapeId)
   const rawBounds = editor.getShapesPageBounds(shapeIds)
@@ -561,28 +628,206 @@ async function sendAnnotationEditRequest(editor, imageShapeId) {
     padding: 0,
     pixelRatio: getAnnotationEditExportPixelRatio(exportBounds)
   })
+  const screenshotAsset = await saveCowartReferenceImage({
+    anchorShapeId: imageShapeId,
+    fileName: annotationEditScreenshotFileName(),
+    dataUrl: exportResult.url,
+    mimeType: 'image/png'
+  })
   const prompt = buildAnnotationEditPrompt({
     imageShapeId,
     shapeIds,
     exportWidth: exportResult.width,
-    exportHeight: exportResult.height
+    exportHeight: exportResult.height,
+    screenshotAsset
   })
   const sender = followUpSender()
   if (!sender) {
     throw new Error('当前 Cowart 画布没有可用的 Codex MCP 消息桥。')
   }
 
-  return sender({
-    prompt,
-    content: [
-      { type: 'text', text: prompt },
+  const content = [{ type: 'text', text: prompt }]
+
+  if (supportsCowartMessageImages()) {
+    content.push(
       dataUrlToImageContent(exportResult.url, {
         cowartAnnotationEdit: true,
         cowartSourceImageShapeId: imageShapeId,
-        cowartIncludedShapeIds: shapeIds
+        cowartIncludedShapeIds: shapeIds,
+        cowartAnnotationScreenshotPath: screenshotAsset.assetPath || null,
+        cowartAnnotationScreenshotFileName: screenshotAsset.fileName || null
       })
-    ]
+    )
+  }
+
+  return sender({ prompt, content })
+}
+
+function clampNumber(value, min, max) {
+  return Math.min(Math.max(value, min), max)
+}
+
+function formatAiImageGenerationTarget(shape) {
+  const targetWidth = Math.round(Number(shape?.props?.w) || AI_IMAGE_HOLDER_DEFAULT_W)
+  const targetHeight = Math.round(Number(shape?.props?.h) || AI_IMAGE_HOLDER_DEFAULT_H)
+  const ratio = targetHeight ? targetWidth / targetHeight : 1
+  const preset = getAiImageAspectPreset(shape)
+  const ratioLabel = preset?.label ?? `${targetWidth}:${targetHeight}`
+
+  return {
+    targetWidth,
+    targetHeight,
+    ratio,
+    ratioLabel,
+    label: `${ratioLabel} · ${targetWidth}x${targetHeight}`
+  }
+}
+
+function getAiImageGenerationPanelLayout(editor, shapeId) {
+  const bounds = editor.getShapePageBounds(shapeId)
+  if (!bounds) return null
+
+  const containerBounds = editor.getContainer().getBoundingClientRect()
+  const viewportWidth = containerBounds.width || window.innerWidth || 0
+  const viewportHeight = containerBounds.height || window.innerHeight || 0
+  if (!viewportWidth || !viewportHeight) return null
+
+  const bottomLeft = editor.pageToViewport({ x: bounds.x, y: bounds.y + bounds.h })
+  const bottomRight = editor.pageToViewport({ x: bounds.x + bounds.w, y: bounds.y + bounds.h })
+  const screenWidth = Math.abs(bottomRight.x - bottomLeft.x)
+  const panelWidth = Math.min(
+    AI_IMAGE_GENERATION_PANEL_MAX_W,
+    Math.max(AI_IMAGE_GENERATION_PANEL_MIN_W, screenWidth * 2.6)
+  )
+  const panelLeft = clampNumber(
+    bottomLeft.x + screenWidth / 2 - panelWidth / 2,
+    AI_IMAGE_GENERATION_PANEL_VIEWPORT_MARGIN,
+    Math.max(AI_IMAGE_GENERATION_PANEL_VIEWPORT_MARGIN, viewportWidth - panelWidth - AI_IMAGE_GENERATION_PANEL_VIEWPORT_MARGIN)
+  )
+  const preferredTop = bottomLeft.y + AI_IMAGE_GENERATION_PANEL_OFFSET
+  const panelTop = clampNumber(
+    preferredTop,
+    AI_IMAGE_GENERATION_PANEL_VIEWPORT_MARGIN,
+    Math.max(AI_IMAGE_GENERATION_PANEL_VIEWPORT_MARGIN, viewportHeight - AI_IMAGE_GENERATION_PANEL_ESTIMATED_H - AI_IMAGE_GENERATION_PANEL_VIEWPORT_MARGIN)
+  )
+
+  return {
+    left: panelLeft,
+    top: panelTop,
+    width: panelWidth
+  }
+}
+
+function aiImageReferenceLines({ references, referenceAttached }) {
+  if (!references.length) return ['Reference images: none']
+
+  const lines = [`Reference images: ${references.length}`]
+  const localPathLines = []
+  references.forEach((reference, index) => {
+    const savedReference = reference.savedReference
+    const displayName = savedReference?.fileName || reference.file?.name || `selected reference image ${index + 1}`
+    if (savedReference?.assetPath) {
+      localPathLines.push(`${index + 1}. ${savedReference.assetPath}`)
+    } else {
+      localPathLines.push(`${index + 1}. ${displayName} (local path unavailable)`)
+    }
   })
+
+  if (localPathLines.some((line) => !line.endsWith('(local path unavailable)'))) {
+    lines.push('Reference image local paths:', ...localPathLines, 'Use these local files as visual references.')
+  } else if (referenceAttached) {
+    lines.push('Reference images are attached as image content blocks; use them as visual references.')
+  } else {
+    lines.push('Reference image local paths were unavailable.')
+  }
+  return lines
+}
+
+function buildAiImageGenerationPrompt({ holderShape, userPrompt, references, referenceAttached }) {
+  const { targetWidth, targetHeight, ratio, ratioLabel } = formatAiImageGenerationTarget(holderShape)
+  const referenceLines = aiImageReferenceLines({ references, referenceAttached })
+
+  return [
+    AI_IMAGE_GENERATION_PROMPT_PREFIX,
+    '',
+    `Cowart AI image holder shape: ${holderShape.id}`,
+    `Target canvas slot: ${targetWidth} x ${targetHeight} canvas units.`,
+    `Target aspect ratio: ${ratioLabel} (${ratio.toFixed(3)} width/height).`,
+    'Compose the final bitmap for this slot without cropping or stretching.',
+    ...referenceLines,
+    '',
+    'Prompt:',
+    userPrompt.trim()
+  ].join('\n')
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.addEventListener('load', () => resolve(String(reader.result || '')))
+    reader.addEventListener('error', () => reject(reader.error || new Error('无法读取参考图。')))
+    reader.readAsDataURL(file)
+  })
+}
+
+function stopEditorOverlayEvent(event) {
+  event.stopPropagation()
+}
+
+async function sendAiImageGenerationRequest({ holderShape, userPrompt, referenceFiles = [] }) {
+  const sender = followUpSender()
+  if (!sender) {
+    throw new Error('当前 Cowart 画布没有可用的 Codex MCP 消息桥。')
+  }
+
+  const imageReferences = referenceFiles.slice(0, AI_IMAGE_REFERENCE_MAX_FILES)
+  const referenceAttached = Boolean(imageReferences.length && supportsCowartMessageImages())
+  const references = []
+
+  for (const [index, referenceFile] of imageReferences.entries()) {
+    const referenceDataUrl = await readFileAsDataUrl(referenceFile)
+    let savedReference = null
+    if (hasCowartWidgetBridge()) {
+      try {
+        savedReference = await saveCowartReferenceImage({
+          holderShapeId: holderShape.id,
+          fileName: referenceFile.name || `reference-${index + 1}.png`,
+          dataUrl: referenceDataUrl,
+          mimeType: referenceFile.type || undefined
+        })
+      } catch (error) {
+        if (!referenceAttached) {
+          throw new Error(`参考图无法保存到 Cowart 本地 assets：${error instanceof Error ? error.message : String(error)}`)
+        }
+        console.warn('Cowart reference image could not be saved; relying on direct image attachment.', error)
+      }
+    } else if (!referenceAttached) {
+      throw new Error('当前 Codex host 没有声明支持图片附件，也没有可用的 Cowart MCP 文件保存桥。')
+    }
+    references.push({ file: referenceFile, dataUrl: referenceDataUrl, savedReference })
+  }
+
+  const prompt = buildAiImageGenerationPrompt({
+    holderShape,
+    userPrompt,
+    references,
+    referenceAttached
+  })
+  const content = [{ type: 'text', text: prompt }]
+
+  if (referenceAttached) {
+    for (const [index, reference] of references.entries()) {
+      content.push(dataUrlToImageContent(reference.dataUrl, {
+        cowartAiImageReference: true,
+        cowartAiImageReferenceIndex: index + 1,
+        cowartAiImageHolderShapeId: holderShape.id,
+        cowartReferenceFileName: reference.file.name || null,
+        cowartReferenceAssetPath: reference.savedReference?.assetPath || null
+      }))
+    }
+  }
+
+  return sender({ prompt, content })
 }
 
 class CowartAnnotationTool extends StateNode {
@@ -808,7 +1053,236 @@ const cowartUiOverrides = {
 const cowartComponents = {
   Toolbar: CowartToolbar,
   ImageToolbar: CowartImageToolbar,
+  InFrontOfTheCanvas: CowartCanvasOverlay,
   StylePanel: CowartStylePanel
+}
+
+function CowartCanvasOverlay() {
+  return <CowartAiImageGenerationPanel />
+}
+
+function CowartAiImageGenerationPanel() {
+  const editor = useEditor()
+  const selectedTarget = useValue(
+    'selected ai image holder generation panel target',
+    () => {
+      const shape = editor.getOnlySelectedShape()
+      if (!isAiImageHolderShape(shape)) return null
+
+      editor.getCamera()
+      editor.getViewportScreenBounds()
+
+      const layout = getAiImageGenerationPanelLayout(editor, shape.id)
+      if (!layout) return null
+
+      return {
+        shape,
+        layout
+      }
+    },
+    [editor]
+  )
+  const fileInputRef = useRef(null)
+  const [promptValue, setPromptValue] = useState('')
+  const [referenceFiles, setReferenceFiles] = useState([])
+  const [referencePreviews, setReferencePreviews] = useState([])
+  const [status, setStatus] = useState('idle')
+  const [errorMessage, setErrorMessage] = useState('')
+
+  useEffect(() => {
+    setStatus('idle')
+    setErrorMessage('')
+  }, [selectedTarget?.shape.id])
+
+  useEffect(() => {
+    if (status !== 'sent') return undefined
+    const timer = window.setTimeout(() => setStatus('idle'), AI_IMAGE_GENERATION_STATUS_RESET_MS)
+    return () => window.clearTimeout(timer)
+  }, [status])
+
+  useEffect(() => {
+    const previews = referenceFiles.map((file, index) => ({
+      file,
+      key: `${file.name}-${file.size}-${file.lastModified}-${index}`,
+      url: URL.createObjectURL(file)
+    }))
+    setReferencePreviews(previews)
+    return () => {
+      previews.forEach((preview) => URL.revokeObjectURL(preview.url))
+    }
+  }, [referenceFiles])
+
+  if (!selectedTarget) return null
+
+  const { shape, layout } = selectedTarget
+  const canSend = promptValue.trim().length > 0 || referenceFiles.length > 0
+  const isSending = status === 'sending'
+
+  function handleReferenceChange(event) {
+    const selectedFiles = Array.from(event.target.files || [])
+    if (!selectedFiles.length) return
+
+    const imageFiles = selectedFiles.filter((file) => file.type.startsWith('image/'))
+    if (imageFiles.length !== selectedFiles.length) {
+      setStatus('error')
+      setErrorMessage('请选择图片文件。')
+      event.target.value = ''
+      return
+    }
+
+    const availableSlots = Math.max(0, AI_IMAGE_REFERENCE_MAX_FILES - referenceFiles.length)
+    if (!availableSlots) {
+      setStatus('error')
+      setErrorMessage(`最多支持 ${AI_IMAGE_REFERENCE_MAX_FILES} 张参考图。`)
+      event.target.value = ''
+      return
+    }
+
+    const filesToAdd = imageFiles.slice(0, availableSlots)
+    setReferenceFiles((currentFiles) => [...currentFiles, ...filesToAdd].slice(0, AI_IMAGE_REFERENCE_MAX_FILES))
+    if (imageFiles.length > availableSlots) {
+      setStatus('error')
+      setErrorMessage(`最多支持 ${AI_IMAGE_REFERENCE_MAX_FILES} 张参考图。`)
+    } else {
+      setStatus('idle')
+      setErrorMessage('')
+    }
+    event.target.value = ''
+  }
+
+  function clearReferences() {
+    setReferenceFiles([])
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+    }
+  }
+
+  function removeReferenceAt(indexToRemove) {
+    setReferenceFiles((currentFiles) => currentFiles.filter((_file, index) => index !== indexToRemove))
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+    }
+    if (status === 'error') {
+      setStatus('idle')
+      setErrorMessage('')
+    }
+  }
+
+  async function handleSubmit(event) {
+    event?.preventDefault()
+    if (!canSend || isSending) return
+
+    setStatus('sending')
+    setErrorMessage('')
+    try {
+      await sendAiImageGenerationRequest({
+        holderShape: shape,
+        userPrompt: promptValue,
+        referenceFiles
+      })
+      setPromptValue('')
+      clearReferences()
+      setStatus('sent')
+    } catch (error) {
+      console.error(error)
+      setStatus('error')
+      setErrorMessage(error instanceof Error ? error.message : '发送失败，请重试。')
+    }
+  }
+
+  function handlePromptKeyDown(event) {
+    stopEditorOverlayEvent(event)
+    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+      handleSubmit(event)
+    }
+  }
+
+  return (
+    <div className="cowart-ai-generation-overlay" aria-hidden={false}>
+      <form
+        aria-label="AI 图片生成"
+        className="cowart-ai-generation-panel"
+        data-status={status}
+        onClick={stopEditorOverlayEvent}
+        onDoubleClick={stopEditorOverlayEvent}
+        onKeyDown={stopEditorOverlayEvent}
+        onPointerDown={stopEditorOverlayEvent}
+        onSubmit={handleSubmit}
+        style={{
+          left: `${layout.left}px`,
+          top: `${layout.top}px`,
+          width: `${layout.width}px`
+        }}
+      >
+        <div className="cowart-ai-generation-reference-row">
+          <div className="cowart-ai-generation-reference-strip">
+            {referencePreviews.map((preview, index) => (
+              <div className="cowart-ai-generation-reference-preview" key={preview.key}>
+                <img alt={`参考图 ${index + 1}`} src={preview.url} />
+                <button aria-label={`移除参考图 ${index + 1}`} onClick={() => removeReferenceAt(index)} type="button">
+                  <TldrawUiButtonIcon icon="cross-2" small />
+                </button>
+              </div>
+            ))}
+            {referenceFiles.length < AI_IMAGE_REFERENCE_MAX_FILES && (
+              <button
+                aria-label="选择参考图"
+                className="cowart-ai-generation-reference-button"
+                onClick={() => fileInputRef.current?.click()}
+                type="button"
+              >
+                <TldrawUiButtonIcon icon="tool-media" small />
+                <span>参考图</span>
+              </button>
+            )}
+          </div>
+          <input
+            ref={fileInputRef}
+            accept="image/*"
+            className="cowart-ai-generation-file-input"
+            multiple
+            onChange={handleReferenceChange}
+            type="file"
+          />
+        </div>
+
+        <textarea
+          aria-label="自定义 prompt"
+          className="cowart-ai-generation-prompt"
+          disabled={isSending}
+          onChange={(event) => {
+            setPromptValue(event.target.value)
+            if (status === 'error') {
+              setStatus('idle')
+              setErrorMessage('')
+            }
+          }}
+          onKeyDown={handlePromptKeyDown}
+          placeholder="今天我们要创作什么"
+          rows={3}
+          value={promptValue}
+        />
+
+        <div className="cowart-ai-generation-footer">
+          <div className="cowart-ai-generation-status" aria-live="polite">
+            {status === 'sending'
+              ? '正在发送'
+              : status === 'sent'
+                ? '已发送'
+                : errorMessage}
+          </div>
+          <button
+            aria-label="发送生成请求"
+            className="cowart-ai-generation-send"
+            disabled={!canSend || isSending}
+            type="submit"
+          >
+            <span>{isSending ? '发送中' : '发送'}</span>
+          </button>
+        </div>
+      </form>
+    </div>
+  )
 }
 
 function CowartStylePanel(props) {
@@ -1210,6 +1684,7 @@ function CowartAnnotationEditToolbarButton({ imageShapeId }) {
         icon={status === 'sent' ? 'check' : status === 'error' ? 'warning-triangle' : 'comment'}
         small
       />
+      <span className="cowart-annotation-edit-toolbar-label">{ANNOTATION_EDIT_TOOL_LABEL}</span>
     </TldrawUiToolbarButton>
   )
 }
@@ -1504,6 +1979,7 @@ export default function App() {
     let hasUnsavedChanges = false
     let isSyncingAnnotationShape = false
     let remoteLoadController = null
+    const acknowledgedImageShapeDeletes = new Set()
 
     async function saveCanvas() {
       if (!hasUnsavedChanges) return
@@ -1515,7 +1991,11 @@ export default function App() {
 
       isSaving = true
       try {
-        await saveCowartCanvasSnapshot(editor.store.getStoreSnapshot())
+        await saveCowartCanvasSnapshot(editor.store.getStoreSnapshot(), {
+          protectImageRecords: true,
+          acknowledgedImageShapeDeletes: Array.from(acknowledgedImageShapeDeletes)
+        })
+        acknowledgedImageShapeDeletes.clear()
         hasUnsavedChanges = false
       } catch (error) {
         console.error(error)
@@ -1573,10 +2053,18 @@ export default function App() {
       }
     }
 
-    const unsubscribe = editor.store.listen(scheduleSave, {
-      source: 'user',
-      scope: 'document'
-    })
+    const unsubscribe = editor.store.listen(
+      ({ changes }) => {
+        for (const imageShapeId of collectRemovedImageShapeIds(changes)) {
+          acknowledgedImageShapeDeletes.add(imageShapeId)
+        }
+        scheduleSave()
+      },
+      {
+        source: 'user',
+        scope: 'document'
+      }
+    )
 
     let canvasEvents = null
     let canvasRefreshTimer = null

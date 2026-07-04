@@ -26,6 +26,7 @@ try {
     "save_cowart_canvas_state",
     "save_cowart_selection_state",
     "save_cowart_view_state",
+    "save_cowart_reference_image",
     "get_cowart_selection",
     "insert_cowart_image",
   ];

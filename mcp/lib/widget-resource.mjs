@@ -285,6 +285,14 @@ function mcpHostBridgeScript() {
       }
     };
 
+    api.getHostCapabilities = () => {
+      try {
+        return typeof app?.getHostCapabilities === "function" ? app.getHostCapabilities() : null;
+      } catch (_error) {
+        return null;
+      }
+    };
+
     api.updateModelContext = async (payload, options) => {
       try {
         if (!app || typeof app.updateModelContext !== "function") return {};
@@ -330,7 +338,7 @@ function mcpHostBridgeScript() {
 
   try {
     mcpApp = new apps.App(
-      { name: "cowart", version: "0.1.4" },
+      { name: "cowart", version: "0.1.6" },
       { availableDisplayModes: ["inline", "fullscreen"] },
       { autoResize: true },
     );
@@ -343,6 +351,10 @@ function mcpHostBridgeScript() {
     mcpApp.ready = mcpApp.connect()
       .then(() => {
         installCowartApi(mcpApp);
+        publishHostGlobals({
+          hostCapabilities: mcpApp.getHostCapabilities && mcpApp.getHostCapabilities(),
+          hostInfo: mcpApp.getHostVersion && mcpApp.getHostVersion(),
+        });
         applyHostContext(mcpApp.getHostContext && mcpApp.getHostContext());
         const initialMode = window.__COWART_INITIAL_DISPLAY_MODE__;
         if (initialMode === "fullscreen" && typeof mcpApp.requestDisplayMode === "function") {

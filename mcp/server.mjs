@@ -23,6 +23,7 @@ import {
   resolveCanvasDir,
   resolveCowartPaths,
   saveCowartCanvasSnapshot,
+  writeCowartPageAsset,
   writeCowartSelectionState,
   writeCowartViewState,
 } from "./lib/canvas-storage.mjs";
@@ -36,6 +37,7 @@ const TOOL_SAVE_SELECTION_STATE = "save_cowart_selection_state";
 const TOOL_SAVE_VIEW_STATE = "save_cowart_view_state";
 const TOOL_GET_SELECTION = "get_cowart_selection";
 const TOOL_INSERT_IMAGE = "insert_cowart_image";
+const TOOL_SAVE_REFERENCE_IMAGE = "save_cowart_reference_image";
 
 const PAGE_ID_PREFIX = "page:";
 const COWART_WIDGET_URI = "ui://widget/cowart/canvas.html";
@@ -60,7 +62,7 @@ const server = new McpServer(
   },
   {
     instructions:
-      "Render and update the native Cowart Codex widget. Use render_cowart_canvas_widget to open the canvas for the active project, get_cowart_selection for persisted widget selection, and insert_cowart_image to place bitmap assets into the project-backed canvas without hand-writing tldraw records.",
+      "Render and update the native Cowart Codex widget. Use render_cowart_canvas_widget to open the canvas for the active project, get_cowart_selection for persisted widget selection, save_cowart_reference_image for widget-provided reference images, and insert_cowart_image to place bitmap assets into the project-backed canvas without hand-writing tldraw records.",
   },
 );
 
@@ -458,6 +460,43 @@ async function insertCowartImage(args = {}) {
   };
 }
 
+async function saveCowartReferenceImage(args = {}) {
+  const canvasState = await readCowartCanvasState(args, { hydrateAssets: false });
+  const snapshot = canvasState.snapshot;
+  if (!snapshot || typeof snapshot !== "object" || !snapshot.schema || !snapshot.store) {
+    throw new Error("No Cowart canvas snapshot exists yet. Open the Cowart widget for the target project and create or save the canvas before saving reference images.");
+  }
+
+  const store = snapshot.store;
+  const { selection } = await readCowartSelectionState(args);
+  const { viewState } = await readCowartViewState(args);
+  const holderShapeId = nonEmptyString(args.holderShapeId) || nonEmptyString(args.anchorShapeId) || firstSelectedShapeId(selection);
+  const holderShape = holderShapeId ? getRecord(store, holderShapeId, "AI image holder shape") : null;
+  const pageId =
+    nonEmptyString(args.pageId) ||
+    (holderShape ? findPageIdForShape(store, holderShape.id) : null) ||
+    nonEmptyString(viewState?.currentPageId) ||
+    Object.values(store).find((record) => record?.typeName === "page")?.id;
+  if (!pageId || !store[pageId]) throw new Error("Could not determine target pageId for the reference image.");
+
+  const result = await writeCowartPageAsset(args, {
+    pageId,
+    fileName: args.fileName,
+    dataUrl: args.dataUrl,
+    dataBase64: args.dataBase64,
+    mimeType: args.mimeType,
+  });
+  const { projectDir } = resolveCowartPaths(args);
+
+  return {
+    ...result,
+    projectDir,
+    holderShapeId: holderShape?.id ?? holderShapeId ?? null,
+    assetPathRelativeToProject: relative(projectDir, result.assetPath),
+    assetPathRelativeToCanvas: relative(result.canvasDir, result.assetPath),
+  };
+}
+
 function registerCowartWidget(mcpServer) {
   registerWidgetResource(mcpServer, {
     name: "cowart-canvas-widget",
@@ -581,6 +620,8 @@ function registerCowartStateTools(mcpServer) {
       inputSchema: {
         ...projectArgsSchema,
         snapshot: z.any(),
+        protectImageRecords: z.boolean().optional(),
+        acknowledgedImageShapeDeletes: z.array(z.string()).optional(),
       },
       annotations: {
         readOnlyHint: false,
@@ -597,7 +638,7 @@ function registerCowartStateTools(mcpServer) {
           content: [
             {
               type: "text",
-              text: "Invalid Cowart canvas snapshot.",
+              text: result.message || "Invalid Cowart canvas snapshot.",
             },
           ],
           structuredContent: result,
@@ -679,6 +720,43 @@ function registerCowartStateTools(mcpServer) {
 }
 
 function registerCowartImageTools(mcpServer) {
+  mcpServer.registerTool(
+    TOOL_SAVE_REFERENCE_IMAGE,
+    {
+      title: "Save Cowart Reference Image",
+      description:
+        "Save a widget-selected reference image into the current Cowart page's assets folder so Codex can read it from the local project when ui/message image attachments are unavailable.",
+      inputSchema: {
+        ...projectArgsSchema,
+        holderShapeId: z.string().trim().optional(),
+        anchorShapeId: z.string().trim().optional(),
+        pageId: z.string().trim().optional(),
+        fileName: z.string().trim().optional(),
+        dataUrl: z.string().optional(),
+        dataBase64: z.string().optional(),
+        mimeType: z.string().trim().optional(),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (input = {}) => {
+      const result = await saveCowartReferenceImage(input);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Saved Cowart reference image to ${result.assetPath}.`,
+          },
+        ],
+        structuredContent: result,
+      };
+    },
+  );
+
   mcpServer.registerTool(
     TOOL_GET_SELECTION,
     {
