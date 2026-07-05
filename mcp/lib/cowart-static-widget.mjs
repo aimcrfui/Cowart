@@ -64,10 +64,21 @@ function viteBinaryPath() {
 }
 
 function runNpmInstall() {
-  return runCommand("npm", ["install"], {
+  const { command, args } = npmInstallCommand();
+  return runCommand(command, args, {
     cwd: pluginRoot(),
     failureLabel: "npm install failed while preparing the Cowart widget",
   });
+}
+
+function npmInstallCommand() {
+  if (process.platform === "win32") {
+    return {
+      command: "cmd.exe",
+      args: ["/d", "/s", "/c", "npm", "install"],
+    };
+  }
+  return { command: "npm", args: ["install"] };
 }
 
 function runViteBuild(outDir) {

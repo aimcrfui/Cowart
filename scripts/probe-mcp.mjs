@@ -7,7 +7,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const transport = new StdioClientTransport({
   command: "node",
-  args: ["./mcp/server.mjs"],
+  args: ["./scripts/start-mcp.mjs"],
 });
 
 const client = new Client({
@@ -16,6 +16,14 @@ const client = new Client({
 });
 
 await client.connect(transport);
+
+function isCanvasDirectory(value) {
+  const canvasDir = String(value || "");
+  return (
+    path.basename(path.normalize(canvasDir)) === "canvas" ||
+    path.win32.basename(path.win32.normalize(canvasDir)) === "canvas"
+  );
+}
 
 try {
   const tools = await client.listTools();
@@ -65,7 +73,7 @@ try {
   if (stateResult.structuredContent?.storage !== "empty") {
     throw new Error("A fresh Cowart project should report empty storage.");
   }
-  if (!String(stateResult.structuredContent?.canvasDir || "").endsWith("/canvas")) {
+  if (!isCanvasDirectory(stateResult.structuredContent?.canvasDir)) {
     throw new Error("Cowart canvas state did not report a project-local canvas directory.");
   }
   if ((stateResult.structuredContent?.hydratedAssets || []).length !== 0) {
