@@ -1668,6 +1668,19 @@ function readFileAsDataUrl(file) {
   })
 }
 
+function clipboardImageFiles(event) {
+  const clipboardData = event.clipboardData
+  if (!clipboardData) return []
+
+  const itemFiles = Array.from(clipboardData.items || [])
+    .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+    .map((item) => item.getAsFile())
+    .filter(Boolean)
+
+  if (itemFiles.length) return itemFiles
+  return Array.from(clipboardData.files || []).filter((file) => file.type.startsWith('image/'))
+}
+
 function stopEditorOverlayEvent(event) {
   event.stopPropagation()
 }
@@ -2398,6 +2411,33 @@ function CowartAiImageGenerationPanel() {
     }
   }
 
+  function handlePromptPaste(event) {
+    const imageFiles = clipboardImageFiles(event)
+    if (!imageFiles.length) return
+
+    event.preventDefault()
+    stopEditorOverlayEvent(event)
+
+    const availableSlots = Math.max(0, AI_IMAGE_REFERENCE_MAX_FILES - referenceFiles.length)
+    if (!availableSlots) {
+      setStatus('error')
+      setErrorMessage(`最多支持 ${AI_IMAGE_REFERENCE_MAX_FILES} 张参考图。`)
+      return
+    }
+
+    setReferenceFiles((currentFiles) => [
+      ...currentFiles,
+      ...imageFiles.slice(0, availableSlots)
+    ].slice(0, AI_IMAGE_REFERENCE_MAX_FILES))
+    if (imageFiles.length > availableSlots) {
+      setStatus('error')
+      setErrorMessage(`最多支持 ${AI_IMAGE_REFERENCE_MAX_FILES} 张参考图。`)
+    } else {
+      setStatus('idle')
+      setErrorMessage('')
+    }
+  }
+
   return (
     <div className="cowart-ai-generation-overlay" aria-hidden={false}>
       <form
@@ -2459,6 +2499,7 @@ function CowartAiImageGenerationPanel() {
             }
           }}
           onKeyDown={handlePromptKeyDown}
+          onPaste={handlePromptPaste}
           placeholder="描述你想生成的图片"
           rows={3}
           value={promptValue}
@@ -2622,6 +2663,33 @@ function CowartAiDraftGenerationPanel() {
     }
   }
 
+  function handlePromptPaste(event) {
+    const imageFiles = clipboardImageFiles(event)
+    if (!imageFiles.length) return
+
+    event.preventDefault()
+    stopEditorOverlayEvent(event)
+
+    const availableSlots = Math.max(0, AI_IMAGE_REFERENCE_MAX_FILES - referenceFiles.length)
+    if (!availableSlots) {
+      setStatus('error')
+      setErrorMessage(`最多支持 ${AI_IMAGE_REFERENCE_MAX_FILES} 张参考图。`)
+      return
+    }
+
+    setReferenceFiles((currentFiles) => [
+      ...currentFiles,
+      ...imageFiles.slice(0, availableSlots)
+    ].slice(0, AI_IMAGE_REFERENCE_MAX_FILES))
+    if (imageFiles.length > availableSlots) {
+      setStatus('error')
+      setErrorMessage(`最多支持 ${AI_IMAGE_REFERENCE_MAX_FILES} 张参考图。`)
+    } else {
+      setStatus('idle')
+      setErrorMessage('')
+    }
+  }
+
   return (
     <div className="cowart-ai-generation-overlay" aria-hidden={false}>
       <form
@@ -2683,6 +2751,7 @@ function CowartAiDraftGenerationPanel() {
             }
           }}
           onKeyDown={handlePromptKeyDown}
+          onPaste={handlePromptPaste}
           placeholder="描述你想生成的 HTML 草稿"
           rows={3}
           value={promptValue}
