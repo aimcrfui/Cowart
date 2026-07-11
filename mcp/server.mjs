@@ -638,11 +638,21 @@ async function insertCowartHtmlDraft(args = {}) {
       existingFileName = null;
     }
   }
+  const shouldForkSharedAsset = Boolean(
+    shouldUpdateExistingDraft &&
+      existingAssetUrl &&
+      Object.values(store).some(
+        (record) =>
+          record?.id !== draftShape.id &&
+          isCowartHtmlDraftShape(record) &&
+          nonEmptyString(record.meta?.cowartHtmlDraftAssetUrl) === existingAssetUrl,
+      ),
+  );
   const requestedName = sanitizeHtmlFileName(
     existingFileName || args.fileName,
     `draft-${Date.now()}.html`,
   );
-  const fileTarget = shouldUpdateExistingDraft && existingFileName
+  const fileTarget = shouldUpdateExistingDraft && existingFileName && !shouldForkSharedAsset
     ? { fileName: requestedName, filePath: join(assetsDir, requestedName) }
     : await uniqueFilePath(assetsDir, requestedName);
   const { fileName, filePath } = fileTarget;
@@ -716,6 +726,7 @@ async function insertCowartHtmlDraft(args = {}) {
     displayUrlKind: "data:text/html;base64",
     bounds,
     updatedExistingHtmlDraft: Boolean(shouldUpdateExistingDraft),
+    forkedSharedHtmlDraftAsset: shouldForkSharedAsset,
     replacedAiDraftHolder: shouldReplaceDraftHolder,
     replacedShapeIds,
     dryRun: Boolean(args.dryRun),
@@ -1134,7 +1145,7 @@ function registerCowartImageTools(mcpServer) {
     {
       title: "Insert Cowart HTML Draft",
       description:
-        "Save a single-file HTML draft into the current Cowart page's assets folder, update a targeted existing HTML draft in place, or replace a targeted AI 草稿 holder by default.",
+        "Save a single-file HTML draft into the current Cowart page's assets folder, update a targeted existing HTML draft in place, or replace a targeted AI Html holder by default.",
       inputSchema: {
         ...projectArgsSchema,
         htmlContent: z.string().optional(),

@@ -62,7 +62,8 @@ import { AllSelection } from '@tiptap/pm/state'
 import html2canvas from 'html2canvas'
 import 'tldraw/tldraw.css'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import aiFrameToolIconRaw from './assets/ai-frame.svg?raw'
+import aiHtmlToolIconRaw from './assets/ai-html.svg?raw'
+import aiImageToolIconRaw from './assets/ai-image.svg?raw'
 import annotationToolIconRaw from './assets/tool-comment.svg?raw'
 import {
   IS_COWART_WIDGET_BUILD,
@@ -74,7 +75,8 @@ import {
   saveCowartCanvasSnapshot,
   saveCowartReferenceImage,
   saveCowartSelectionState,
-  saveCowartViewState
+  saveCowartViewState,
+  updateCowartHtmlDraft
 } from './cowartClient.js'
 import {
   describeSkippedRecord,
@@ -88,7 +90,7 @@ const GLOBAL_ASSETS_ROUTE = '/assets/'
 const AI_IMAGE_TOOL_ID = 'ai-image'
 const AI_IMAGE_HOLDER_LABEL = 'AI 图片'
 const AI_DRAFT_TOOL_ID = 'ai-draft'
-const AI_DRAFT_HOLDER_LABEL = 'AI 草稿'
+const AI_DRAFT_HOLDER_LABEL = 'AI Html'
 const AI_IMAGE_HOLDER_DEFAULT_W = 512
 const AI_IMAGE_HOLDER_DEFAULT_H = 683
 const AI_IMAGE_SIZE_MIN = 16
@@ -139,10 +141,12 @@ const ANNOTATION_EDIT_RELATED_TEXT_MARGIN = 120
 const ANNOTATION_EDIT_STATUS_RESET_MS = 2200
 const ANNOTATION_EDIT_COLORS = new Set(['red', 'yellow', 'orange'])
 const HTML_DRAFT_DOWNLOAD_LABEL = '下载原图'
+const HTML_DRAFT_DOM_EDIT_LABEL = '编辑文本'
+const HTML_DRAFT_DOM_EDIT_DONE_LABEL = '完成编辑'
 const HTML_DRAFT_ANNOTATION_EDIT_LABEL = '按标注修改'
 const HTML_DRAFT_ANNOTATION_IMAGE_LABEL = '按标注生图'
 const HTML_DRAFT_ANNOTATION_EDIT_PROMPT = [
-  '[@cowart](plugin://cowart@personal) 按标注修改 AI 草稿',
+  '[@cowart](plugin://cowart@personal) 按标注修改 AI Html',
   '',
   '请根据这张 Cowart 截图里的标注修改当前选中的 HTML 草稿：',
   '- 截图包含当前 HTML 草稿，以及草稿周围的标注箭头和标注文字。',
@@ -170,19 +174,27 @@ const AI_IMAGE_GENERATION_PROMPT_PREFIX = [
   '不需要选择生图模型，使用 Codex 当前可用的图片生成能力。'
 ].join('\n')
 const AI_DRAFT_GENERATION_PROMPT_PREFIX = [
-  '[@cowart](plugin://cowart@personal) 生成 AI 草稿',
+  '[@cowart](plugin://cowart@personal) 生成 AI Html',
   '',
-  '请根据下面的 prompt 生成一个单文件 HTML 草稿，并把它嵌入当前选中的 Cowart AI 草稿框。',
+  '请根据下面的 prompt 生成一个单文件 HTML 草稿，并把它嵌入当前选中的 Cowart AI Html 框。',
   '这不是图片生成任务：不要生成 bitmap，不要调用 insert_cowart_image。',
   '请生成完整可运行的 HTML 文档，CSS 和 JS 尽量内联，适合直接放进 iframe 预览。',
-  '完成后调用 Cowart MCP 工具 insert_cowart_html_draft，把 htmlContent 写入当前 page 的 canvas/pages/<page-id>/assets/，并替换对应 AI 草稿框为 HTML embed。'
+  '完成后调用 Cowart MCP 工具 insert_cowart_html_draft，把 htmlContent 写入当前 page 的 canvas/pages/<page-id>/assets/，并替换对应 AI Html 框为 HTML embed。'
 ].join('\n')
-const aiFrameToolIconSvg = aiFrameToolIconRaw.replaceAll('black', 'currentColor')
-const aiFrameToolIcon = (
+const aiImageToolIconSvg = aiImageToolIconRaw.replaceAll('black', 'currentColor')
+const aiImageToolIcon = (
   <div
     aria-hidden="true"
     className="cowart-ai-frame-tool-icon"
-    dangerouslySetInnerHTML={{ __html: aiFrameToolIconSvg }}
+    dangerouslySetInnerHTML={{ __html: aiImageToolIconSvg }}
+  />
+)
+const aiHtmlToolIconSvg = aiHtmlToolIconRaw.replaceAll('black', 'currentColor')
+const aiHtmlToolIcon = (
+  <div
+    aria-hidden="true"
+    className="cowart-ai-frame-tool-icon"
+    dangerouslySetInnerHTML={{ __html: aiHtmlToolIconSvg }}
   />
 )
 const annotationToolIconSvg = annotationToolIconRaw.replaceAll('black', 'currentColor')
@@ -200,6 +212,7 @@ const cowartAssetUrls = buildCowartAssetUrls()
 const cowartAssetObjectUrlCache = new Map()
 const cowartAssetSourceKeys = new Map()
 const cowartHtmlDraftIframes = new Map()
+const cowartHtmlDraftDomEditSessions = new Map()
 
 const cowartTldrawAssetStore = {
   upload: async (_asset, file) => ({ src: await readFileAsDataUrl(file) }),
@@ -798,7 +811,7 @@ function collectHtmlDraftAnnotationShapeIds(editor, draftShapeId) {
     editor,
     draftShapeId,
     isCowartHtmlDraftEmbedShape,
-    '请选择一个已生成 HTML 的 AI 草稿。'
+    '请选择一个已生成 HTML 的 AI Html。'
   )
 }
 
@@ -941,6 +954,259 @@ async function waitForHtmlDraftDocument(shapeId) {
   throw new Error('HTML 草稿仍在加载，请稍后重试。')
 }
 
+const COWART_DOM_EDITOR_STYLE_ID = 'cowart-dom-editor-style'
+const COWART_DOM_EDITOR_ACTIVE_ATTRIBUTE = 'data-cowart-dom-editor-active'
+const COWART_DOM_EDITOR_HOVER_ATTRIBUTE = 'data-cowart-dom-editor-hover'
+const COWART_DOM_EDITOR_SELECTED_ATTRIBUTE = 'data-cowart-dom-editor-selected'
+const COWART_DOM_EDITOR_EDITABLE_ATTRIBUTE = 'data-cowart-dom-editor-editable'
+const COWART_DOM_EDITOR_ADDED_CONTENTEDITABLE_ATTRIBUTE =
+  'data-cowart-dom-editor-added-contenteditable'
+
+function cowartHtmlDraftDataUrl(htmlContent) {
+  const bytes = new TextEncoder().encode(String(htmlContent || ''))
+  const chunks = []
+  const chunkSize = 8192
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + chunkSize)))
+  }
+  return `data:text/html;base64,${window.btoa(chunks.join(''))}`
+}
+
+function serializeHtmlDoctype(doctype) {
+  if (!doctype) return '<!doctype html>'
+  let result = `<!DOCTYPE ${doctype.name}`
+  if (doctype.publicId) result += ` PUBLIC "${doctype.publicId}"`
+  if (doctype.systemId) result += doctype.publicId ? ` "${doctype.systemId}"` : ` SYSTEM "${doctype.systemId}"`
+  return `${result}>`
+}
+
+function serializeCowartHtmlDraftDocument(iframeDocument) {
+  const root = iframeDocument.documentElement.cloneNode(true)
+  root.removeAttribute(COWART_DOM_EDITOR_ACTIVE_ATTRIBUTE)
+  root.querySelector(`#${COWART_DOM_EDITOR_STYLE_ID}`)?.remove()
+  for (const element of root.querySelectorAll(
+    `[${COWART_DOM_EDITOR_HOVER_ATTRIBUTE}],` +
+      `[${COWART_DOM_EDITOR_SELECTED_ATTRIBUTE}],` +
+      `[${COWART_DOM_EDITOR_EDITABLE_ATTRIBUTE}],` +
+      `[${COWART_DOM_EDITOR_ADDED_CONTENTEDITABLE_ATTRIBUTE}]`
+  )) {
+    element.removeAttribute(COWART_DOM_EDITOR_HOVER_ATTRIBUTE)
+    element.removeAttribute(COWART_DOM_EDITOR_SELECTED_ATTRIBUTE)
+    element.removeAttribute(COWART_DOM_EDITOR_EDITABLE_ATTRIBUTE)
+    if (element.hasAttribute(COWART_DOM_EDITOR_ADDED_CONTENTEDITABLE_ATTRIBUTE)) {
+      element.removeAttribute('contenteditable')
+      element.removeAttribute('spellcheck')
+      element.removeAttribute(COWART_DOM_EDITOR_ADDED_CONTENTEDITABLE_ATTRIBUTE)
+    }
+  }
+  return `${serializeHtmlDoctype(iframeDocument.doctype)}\n${root.outerHTML}`
+}
+
+function isCowartDomTextElement(element) {
+  if (!element || ['HTML', 'BODY', 'SCRIPT', 'STYLE', 'SVG', 'CANVAS', 'IMG', 'VIDEO'].includes(element.tagName)) {
+    return false
+  }
+  if (!element.textContent?.trim()) return false
+  return Array.from(element.childNodes).some(
+    (node) => node.nodeType === window.Node.TEXT_NODE && node.textContent?.trim()
+  )
+}
+
+function cowartDomSelectionTarget(target, iframeDocument) {
+  const ElementClass = iframeDocument.defaultView?.Element
+  if (!ElementClass || !(target instanceof ElementClass)) return null
+  if (target.closest('script, style, link, meta, title, noscript')) return null
+  return target.closest('svg') || target
+}
+
+function placeCowartDomCaret(iframeDocument, element, clientX, clientY) {
+  const selection = iframeDocument.getSelection()
+  if (!selection) return
+
+  let range = iframeDocument.caretRangeFromPoint?.(clientX, clientY) || null
+  if (!range || !element.contains(range.startContainer)) {
+    range = iframeDocument.createRange()
+    range.selectNodeContents(element)
+    range.collapse(false)
+  }
+  selection.removeAllRanges()
+  selection.addRange(range)
+}
+
+function captureCowartDomTextSelection(iframeDocument) {
+  const selection = iframeDocument.getSelection()
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null
+
+  return {
+    anchorNode: selection.anchorNode,
+    anchorOffset: selection.anchorOffset,
+    focusNode: selection.focusNode,
+    focusOffset: selection.focusOffset,
+    ranges: Array.from({ length: selection.rangeCount }, (_, index) =>
+      selection.getRangeAt(index).cloneRange()
+    )
+  }
+}
+
+function restoreCowartDomTextSelection(iframeDocument, selectionSnapshot) {
+  if (!selectionSnapshot) return false
+  const selection = iframeDocument.getSelection()
+  if (!selection) return false
+
+  selection.removeAllRanges()
+  if (
+    typeof selection.setBaseAndExtent === 'function' &&
+    selectionSnapshot.anchorNode?.isConnected &&
+    selectionSnapshot.focusNode?.isConnected
+  ) {
+    selection.setBaseAndExtent(
+      selectionSnapshot.anchorNode,
+      selectionSnapshot.anchorOffset,
+      selectionSnapshot.focusNode,
+      selectionSnapshot.focusOffset
+    )
+    return true
+  }
+
+  for (const range of selectionSnapshot.ranges) selection.addRange(range)
+  return selection.rangeCount > 0 && !selection.isCollapsed
+}
+
+function createCowartHtmlDraftDomEditorSession(iframeDocument, { onSave, onRequestExit }) {
+  const style = iframeDocument.createElement('style')
+  style.id = COWART_DOM_EDITOR_STYLE_ID
+  style.textContent = `
+    [${COWART_DOM_EDITOR_HOVER_ATTRIBUTE}]:not([${COWART_DOM_EDITOR_SELECTED_ATTRIBUTE}]) {
+      outline: 1px dashed #2f80ed !important;
+      outline-offset: 2px !important;
+    }
+    [${COWART_DOM_EDITOR_SELECTED_ATTRIBUTE}] {
+      outline: 2px solid #2f80ed !important;
+      outline-offset: 2px !important;
+    }
+    [${COWART_DOM_EDITOR_EDITABLE_ATTRIBUTE}] {
+      cursor: text !important;
+    }
+  `
+  iframeDocument.head?.append(style)
+  iframeDocument.documentElement.setAttribute(COWART_DOM_EDITOR_ACTIVE_ATTRIBUTE, 'true')
+
+  let selectedElement = null
+  let hoveredElement = null
+  let revision = 0
+  let savedRevision = 0
+  let savePromise = null
+
+  function clearHoveredElement() {
+    hoveredElement?.removeAttribute(COWART_DOM_EDITOR_HOVER_ATTRIBUTE)
+    hoveredElement = null
+  }
+
+  function clearSelectedElement() {
+    if (!selectedElement) return
+    selectedElement.removeAttribute(COWART_DOM_EDITOR_SELECTED_ATTRIBUTE)
+    selectedElement.removeAttribute(COWART_DOM_EDITOR_EDITABLE_ATTRIBUTE)
+    if (selectedElement.hasAttribute(COWART_DOM_EDITOR_ADDED_CONTENTEDITABLE_ATTRIBUTE)) {
+      selectedElement.removeAttribute('contenteditable')
+      selectedElement.removeAttribute('spellcheck')
+      selectedElement.removeAttribute(COWART_DOM_EDITOR_ADDED_CONTENTEDITABLE_ATTRIBUTE)
+    }
+    selectedElement = null
+  }
+
+  function selectElement(element, event) {
+    const textSelection = captureCowartDomTextSelection(iframeDocument)
+    if (selectedElement !== element) clearSelectedElement()
+    selectedElement = element
+    selectedElement.setAttribute(COWART_DOM_EDITOR_SELECTED_ATTRIBUTE, 'true')
+
+    if (!isCowartDomTextElement(selectedElement)) return
+    selectedElement.setAttribute(COWART_DOM_EDITOR_EDITABLE_ATTRIBUTE, 'true')
+    if (!selectedElement.hasAttribute('contenteditable')) {
+      selectedElement.setAttribute('contenteditable', 'plaintext-only')
+      selectedElement.setAttribute('spellcheck', 'false')
+      selectedElement.setAttribute(COWART_DOM_EDITOR_ADDED_CONTENTEDITABLE_ATTRIBUTE, 'true')
+    }
+    selectedElement.focus({ preventScroll: true })
+    if (!restoreCowartDomTextSelection(iframeDocument, textSelection)) {
+      placeCowartDomCaret(iframeDocument, selectedElement, event.clientX, event.clientY)
+    }
+  }
+
+  function handlePointerOver(event) {
+    const nextElement = cowartDomSelectionTarget(event.target, iframeDocument)
+    if (!nextElement || nextElement === selectedElement || nextElement === hoveredElement) return
+    clearHoveredElement()
+    hoveredElement = nextElement
+    hoveredElement.setAttribute(COWART_DOM_EDITOR_HOVER_ATTRIBUTE, 'true')
+  }
+
+  function handlePointerOut(event) {
+    if (hoveredElement && !hoveredElement.contains(event.relatedTarget)) clearHoveredElement()
+  }
+
+  function handleClick(event) {
+    const element = cowartDomSelectionTarget(event.target, iframeDocument)
+    if (!element) return
+    event.preventDefault()
+    event.stopPropagation()
+    event.stopImmediatePropagation()
+    clearHoveredElement()
+    selectElement(element, event)
+  }
+
+  function handleInput(event) {
+    if (!selectedElement || !selectedElement.contains(event.target)) return
+    revision += 1
+  }
+
+  function handleKeyDown(event) {
+    if (event.key !== 'Escape') return
+    event.preventDefault()
+    event.stopPropagation()
+    onRequestExit()
+  }
+
+  iframeDocument.addEventListener('pointerover', handlePointerOver, true)
+  iframeDocument.addEventListener('pointerout', handlePointerOut, true)
+  iframeDocument.addEventListener('click', handleClick, true)
+  iframeDocument.addEventListener('input', handleInput, true)
+  iframeDocument.addEventListener('keydown', handleKeyDown, true)
+
+  async function flush() {
+    if (savePromise) await savePromise
+    if (revision === savedRevision) return null
+
+    const targetRevision = revision
+    const htmlContent = serializeCowartHtmlDraftDocument(iframeDocument)
+    savePromise = Promise.resolve(onSave(htmlContent))
+    try {
+      const result = await savePromise
+      savedRevision = targetRevision
+      if (revision > savedRevision) return flush()
+      return result
+    } finally {
+      savePromise = null
+    }
+  }
+
+  function dispose({ save = true } = {}) {
+    const pendingSave = save ? flush() : Promise.resolve(null)
+    iframeDocument.removeEventListener('pointerover', handlePointerOver, true)
+    iframeDocument.removeEventListener('pointerout', handlePointerOut, true)
+    iframeDocument.removeEventListener('click', handleClick, true)
+    iframeDocument.removeEventListener('input', handleInput, true)
+    iframeDocument.removeEventListener('keydown', handleKeyDown, true)
+    clearHoveredElement()
+    clearSelectedElement()
+    iframeDocument.documentElement.removeAttribute(COWART_DOM_EDITOR_ACTIVE_ATTRIBUTE)
+    style.remove()
+    return pendingSave
+  }
+
+  return { dispose, flush }
+}
+
 async function waitForHtmlDraftAssets(iframeDocument) {
   const pending = []
   if (iframeDocument.fonts?.ready) pending.push(iframeDocument.fonts.ready.catch(() => undefined))
@@ -999,7 +1265,7 @@ function getCowartHtmlDraftLocalPath(shape) {
 
 async function renderCowartHtmlDraftCanvas(shape, pixelRatio) {
   if (!isCowartHtmlDraftEmbedShape(shape)) {
-    throw new Error('请选择一个已生成 HTML 的 AI 草稿。')
+    throw new Error('请选择一个已生成 HTML 的 AI Html。')
   }
 
   const iframeDocument = await waitForHtmlDraftDocument(shape.id)
@@ -1239,7 +1505,7 @@ async function sendHtmlDraftAnnotationRequest(editor, draftShapeId, mode) {
 
   const draftShape = editor.getShape(draftShapeId)
   if (!isCowartHtmlDraftEmbedShape(draftShape)) {
-    throw new Error('请选择一个已生成 HTML 的 AI 草稿。')
+    throw new Error('请选择一个已生成 HTML 的 AI Html。')
   }
 
   const exportResult = await exportCowartHtmlDraftAnnotationScreenshot(editor, draftShapeId)
@@ -1386,7 +1652,7 @@ function buildAiDraftGenerationPrompt({ holderShape, userPrompt, references, ref
     `- Call insert_cowart_html_draft with draftShapeId: "${holderShape.id}".`,
     '- Pass the final HTML document as htmlContent.',
     '- Use a short .html fileName that describes the draft.',
-    '- Leave replaceDraftHolder unset or true so the AI 草稿 frame becomes the embedded HTML preview.',
+    '- Leave replaceDraftHolder unset or true so the AI Html frame becomes the embedded HTML preview.',
     '',
     'Prompt:',
     userPrompt.trim()
@@ -1699,15 +1965,15 @@ const COWART_HTML_DRAFT_EMBED_DEFINITION = {
 }
 
 function CowartHtmlDraftEmbed({ shape }) {
+  const editor = useEditor()
   const directHtmlUrl = isCowartHtmlDraftDataUrl(shape.props.url) ? shape.props.url : null
   const draftAssetUrl =
     cowartHtmlDraftAssetUrlFromVirtualUrl(shape.meta?.cowartHtmlDraftAssetUrl) ||
     cowartHtmlDraftAssetUrlFromVirtualUrl(shape.props.url)
   const isEditing = useIsEditing(shape.id)
-  const [objectUrl, setObjectUrl] = useState(null)
+  const [htmlSource, setHtmlSource] = useState(null)
   const [loadError, setLoadError] = useState(null)
-  const iframeSrc =
-    objectUrl || (!hasCowartWidgetBridge() && draftAssetUrl ? draftAssetUrl : directHtmlUrl)
+  const [frameLoadVersion, setFrameLoadVersion] = useState(0)
 
   const handleIframeRef = useCallback(
     (iframe) => {
@@ -1721,26 +1987,27 @@ function CowartHtmlDraftEmbed({ shape }) {
   )
 
   useEffect(() => {
-    setObjectUrl(null)
+    setHtmlSource(null)
     setLoadError(null)
     const shouldReadPageAsset = draftAssetUrl && hasCowartWidgetBridge()
-    const shouldConvertDataUrl = !shouldReadPageAsset && directHtmlUrl
-    if (!shouldReadPageAsset && !shouldConvertDataUrl) return undefined
+    const browserSourceUrl = !shouldReadPageAsset && (draftAssetUrl || directHtmlUrl)
+    if (!shouldReadPageAsset && !browserSourceUrl) return undefined
 
     let isDisposed = false
-    let nextObjectUrl = null
 
-    const htmlBlobPromise = shouldReadPageAsset
+    const htmlSourcePromise = shouldReadPageAsset
       ? readCowartPageAsset(draftAssetUrl).then((pageAsset) =>
-          blobFromBase64(pageAsset.dataBase64, pageAsset.mimeType)
+          blobFromBase64(pageAsset.dataBase64, pageAsset.mimeType).text()
         )
-      : window.fetch(directHtmlUrl).then((response) => response.blob())
+      : window.fetch(browserSourceUrl).then((response) => {
+          if (!response.ok) throw new Error(`HTML 草稿加载失败：${response.status}`)
+          return response.text()
+        })
 
-    htmlBlobPromise
-      .then((htmlBlob) => {
+    htmlSourcePromise
+      .then((htmlContent) => {
         if (isDisposed) return
-        nextObjectUrl = URL.createObjectURL(htmlBlob)
-        setObjectUrl(nextObjectUrl)
+        setHtmlSource(htmlContent)
       })
       .catch((error) => {
         if (isDisposed) return
@@ -1750,13 +2017,63 @@ function CowartHtmlDraftEmbed({ shape }) {
 
     return () => {
       isDisposed = true
-      if (nextObjectUrl) URL.revokeObjectURL(nextObjectUrl)
     }
   }, [directHtmlUrl, draftAssetUrl])
 
+  const persistDomEdits = useCallback(
+    async (htmlContent) => {
+      const result = await updateCowartHtmlDraft({ draftShapeId: shape.id, htmlContent })
+      const latestShape = editor.getShape(shape.id)
+      if (!isCowartHtmlDraftEmbedShape(latestShape)) return
+      editor.updateShape({
+        id: shape.id,
+        type: 'embed',
+        meta: {
+          ...latestShape.meta,
+          ...(result?.assetUrl ? { cowartHtmlDraftAssetUrl: result.assetUrl } : {})
+        },
+        props: { url: cowartHtmlDraftDataUrl(htmlContent) }
+      })
+    },
+    [editor, shape.id]
+  )
+
+  const exitDomEditing = useCallback(() => {
+    editor.setEditingShape(null)
+    editor.setCurrentTool('select')
+  }, [editor])
+
+  useEffect(() => {
+    if (!isEditing || !htmlSource) return undefined
+
+    let disposed = false
+    let session = null
+    waitForHtmlDraftDocument(shape.id)
+      .then((iframeDocument) => {
+        if (disposed) return
+        session = createCowartHtmlDraftDomEditorSession(iframeDocument, {
+          onSave: persistDomEdits,
+          onRequestExit: exitDomEditing
+        })
+        cowartHtmlDraftDomEditSessions.set(shape.id, session)
+      })
+      .catch((error) => console.error('Cowart could not start HTML DOM editing.', error))
+
+    return () => {
+      disposed = true
+      if (!session) return
+      if (cowartHtmlDraftDomEditSessions.get(shape.id) === session) {
+        cowartHtmlDraftDomEditSessions.delete(shape.id)
+      }
+      session
+        .dispose({ save: true })
+        .catch((error) => console.error('Cowart could not save HTML DOM edits.', error))
+    }
+  }, [exitDomEditing, frameLoadVersion, htmlSource, isEditing, persistDomEdits, shape.id])
+
   return (
     <HTMLContainer className="cowart-html-draft-container" id={shape.id}>
-      {iframeSrc ? (
+      {htmlSource ? (
         <iframe
           ref={handleIframeRef}
           className="cowart-html-draft-frame"
@@ -1764,9 +2081,10 @@ function CowartHtmlDraftEmbed({ shape }) {
           draggable={false}
           frameBorder="0"
           height={toDomPrecision(shape.props.h)}
+          onLoad={() => setFrameLoadVersion((version) => version + 1)}
           referrerPolicy="no-referrer"
           sandbox="allow-forms allow-popups allow-same-origin allow-scripts"
-          src={iframeSrc}
+          srcDoc={htmlSource}
           tabIndex={isEditing ? 0 : -1}
           title={AI_DRAFT_HOLDER_LABEL}
           width={toDomPrecision(shape.props.w)}
@@ -1865,7 +2183,7 @@ const cowartUiOverrides = {
       [AI_IMAGE_TOOL_ID]: {
         id: AI_IMAGE_TOOL_ID,
         label: 'tool.ai-image',
-        icon: aiFrameToolIcon,
+        icon: aiImageToolIcon,
         kbd: 'a',
         onSelect() {
           createAiImageHolderAtViewportCenter(editor)
@@ -1890,7 +2208,7 @@ const cowartUiOverrides = {
       [AI_DRAFT_TOOL_ID]: {
         id: AI_DRAFT_TOOL_ID,
         label: 'tool.ai-draft',
-        icon: aiFrameToolIcon,
+        icon: aiHtmlToolIcon,
         onSelect() {
           createAiDraftHolderAtViewportCenter(editor)
         },
@@ -2307,7 +2625,7 @@ function CowartAiDraftGenerationPanel() {
   return (
     <div className="cowart-ai-generation-overlay" aria-hidden={false}>
       <form
-        aria-label="AI 草稿生成"
+        aria-label="AI Html 生成"
         className="cowart-ai-generation-panel"
         data-status={status}
         onClick={stopEditorOverlayEvent}
@@ -2625,12 +2943,17 @@ function CowartHtmlDraftToolbar({ draftShapeId }) {
   const editor = useEditor()
   const showToolbar = useValue(
     'cowart show html draft toolbar',
-    () => editor.isInAny('select.idle', 'select.pointing_shape'),
+    () => editor.isInAny('select.idle', 'select.pointing_shape', 'select.editing_shape'),
     [editor]
   )
   const isLocked = useValue(
     'cowart html draft toolbar locked',
     () => editor.getShape(draftShapeId)?.isLocked === true,
+    [editor, draftShapeId]
+  )
+  const isDomEditing = useValue(
+    'cowart html draft dom editing',
+    () => editor.getEditingShapeId() === draftShapeId,
     [editor, draftShapeId]
   )
   const getSelectionBounds = useCallback(() => {
@@ -2645,33 +2968,103 @@ function CowartHtmlDraftToolbar({ draftShapeId }) {
     <TldrawUiContextualToolbar
       className="tlui-media__toolbar tlui-image__toolbar cowart-html-draft__toolbar"
       getSelectionBounds={getSelectionBounds}
-      label="AI 草稿工具栏"
+      label="AI Html 工具栏"
     >
-      <CowartHtmlDraftToolbarButton
-        action="download"
-        draftShapeId={draftShapeId}
-        icon="download"
-        label={HTML_DRAFT_DOWNLOAD_LABEL}
-      />
-      <CowartHtmlDraftToolbarButton
-        action="edit"
-        draftShapeId={draftShapeId}
-        icon="tool-highlight"
-        label={HTML_DRAFT_ANNOTATION_EDIT_LABEL}
-        showLabel
-      />
-      <CowartHtmlDraftToolbarButton
-        action="image"
-        draftShapeId={draftShapeId}
-        icon="tool-media"
-        label={HTML_DRAFT_ANNOTATION_IMAGE_LABEL}
-        showLabel
-      />
+      {!isDomEditing && (
+        <CowartHtmlDraftToolbarButton
+          action="download"
+          draftShapeId={draftShapeId}
+          icon="download"
+          label={HTML_DRAFT_DOWNLOAD_LABEL}
+        />
+      )}
+      <CowartHtmlDraftDomEditButton draftShapeId={draftShapeId} isEditing={isDomEditing} />
+      {!isDomEditing && (
+        <>
+          <CowartHtmlDraftToolbarButton
+            action="edit"
+            draftShapeId={draftShapeId}
+            icon="tool-highlight"
+            label={HTML_DRAFT_ANNOTATION_EDIT_LABEL}
+            showLabel
+          />
+          <CowartHtmlDraftToolbarButton
+            action="image"
+            draftShapeId={draftShapeId}
+            icon="tool-media"
+            iconElement={aiImageToolIcon}
+            label={HTML_DRAFT_ANNOTATION_IMAGE_LABEL}
+            showLabel
+          />
+        </>
+      )}
     </TldrawUiContextualToolbar>
   )
 }
 
-function CowartHtmlDraftToolbarButton({ action, draftShapeId, icon, label, showLabel = false }) {
+function CowartHtmlDraftDomEditButton({ draftShapeId, isEditing }) {
+  const editor = useEditor()
+  const [status, setStatus] = useState('idle')
+  const label = isEditing ? HTML_DRAFT_DOM_EDIT_DONE_LABEL : HTML_DRAFT_DOM_EDIT_LABEL
+
+  useEffect(() => {
+    setStatus('idle')
+  }, [draftShapeId, isEditing])
+
+  async function handleClick() {
+    if (status === 'saving') return
+    if (!isEditing) {
+      editor.setEditingShape(draftShapeId)
+      editor.setCurrentTool('select.editing_shape')
+      window.requestAnimationFrame(() => cowartHtmlDraftIframes.get(draftShapeId)?.focus())
+      return
+    }
+
+    setStatus('saving')
+    try {
+      await cowartHtmlDraftDomEditSessions.get(draftShapeId)?.flush()
+      editor.setEditingShape(null)
+      editor.setCurrentTool('select')
+    } catch (error) {
+      console.error(error)
+      setStatus('error')
+    }
+  }
+
+  const title =
+    status === 'saving'
+      ? '正在保存网页内容'
+      : status === 'error'
+        ? '网页内容保存失败，请重试'
+        : label
+
+  return (
+    <TldrawUiToolbarButton
+      aria-label={title}
+      className="cowart-html-draft-toolbar-button"
+      data-action="dom-edit"
+      data-compact="false"
+      data-status={status}
+      data-testid="tool.cowart-html-draft-dom-edit"
+      disabled={status === 'saving'}
+      onClick={handleClick}
+      title={title}
+      type="icon"
+    >
+      <TldrawUiButtonIcon icon={isEditing ? 'check' : 'tool-text'} small />
+      <span className="cowart-html-draft-toolbar-label">{label}</span>
+    </TldrawUiToolbarButton>
+  )
+}
+
+function CowartHtmlDraftToolbarButton({
+  action,
+  draftShapeId,
+  icon,
+  iconElement,
+  label,
+  showLabel = false
+}) {
   const editor = useEditor()
   const [status, setStatus] = useState('idle')
 
@@ -2725,7 +3118,11 @@ function CowartHtmlDraftToolbarButton({ action, draftShapeId, icon, label, showL
       title={title}
       type="icon"
     >
-      <TldrawUiButtonIcon icon={statusIcon} small />
+      {status === 'idle' && iconElement ? (
+        iconElement
+      ) : (
+        <TldrawUiButtonIcon icon={statusIcon} small />
+      )}
       {showLabel && <span className="cowart-html-draft-toolbar-label">{label}</span>}
     </TldrawUiToolbarButton>
   )

@@ -9,6 +9,7 @@ const TOOL_SAVE_VIEW_STATE = 'save_cowart_view_state'
 const TOOL_SAVE_REFERENCE_IMAGE = 'save_cowart_reference_image'
 const TOOL_READ_PAGE_ASSET = 'read_cowart_page_asset'
 const TOOL_DOWNLOAD_FILE = 'download_cowart_file'
+const TOOL_INSERT_HTML_DRAFT = 'insert_cowart_html_draft'
 const WIDGET_PAYLOAD_TIMEOUT_MS = 5000
 
 globalThis.__COWART_WIDGET_FETCH_GUARD__ = true
@@ -201,6 +202,22 @@ export async function downloadCowartFile(download) {
   }
 
   return callCowartServerTool(TOOL_DOWNLOAD_FILE, download)
+}
+
+export async function updateCowartHtmlDraft({ draftShapeId, htmlContent }) {
+  if (!hasCowartWidgetBridge()) {
+    return fetchJson('/api/html-draft', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ draftShapeId, htmlContent })
+    })
+  }
+
+  return callCowartServerTool(TOOL_INSERT_HTML_DRAFT, {
+    draftShapeId,
+    htmlContent,
+    updateExistingDraft: true
+  })
 }
 
 export async function readCowartPageAsset(assetUrl, options = {}) {

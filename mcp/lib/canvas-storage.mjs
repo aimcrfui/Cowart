@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { copyFile, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 
 const PAGE_ID_PREFIX = "page:";
@@ -402,6 +402,26 @@ async function readJsonFile(filePath) {
 }
 
 async function readPageSnapshots(args = {}) {
+  let manifest = null;
+  try {
+    manifest = await readJsonFile(pagesManifestFile(args));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  if (manifest) {
+    if (!Array.isArray(manifest.pages)) throw new Error(`Invalid pages manifest in ${pagesManifestFile(args)}`);
+    const snapshots = [];
+    for (const page of manifest.pages) {
+      const filePath = pageFilePath(args, page.id);
+      const snapshot = await readJsonFile(filePath);
+      if (!isCanvasSnapshot(snapshot)) {
+        throw new Error(`Invalid canvas snapshot in ${filePath}`);
+      }
+      snapshots.push({ filePath, snapshot });
+    }
+    return snapshots;
+  }
+
   let entries;
   try {
     entries = await readdir(canvasPagesDir(args), { withFileTypes: true });
@@ -471,6 +491,13 @@ async function saveStoredCanvasSnapshot(args, snapshot) {
     return { storage: "legacy-single-file", paths: [canvasFile(args)] };
   }
 
+  let previousManifest = null;
+  try {
+    previousManifest = await readJsonFile(pagesManifestFile(args));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+
   const paths = [];
   for (const page of pages) {
     const filePath = pageFilePath(args, page.id);
@@ -490,6 +517,12 @@ async function saveStoredCanvasSnapshot(args, snapshot) {
     })),
   };
   await writeJsonAtomic(pagesManifestFile(args), manifest);
+
+  const currentPageIds = new Set(pages.map((page) => page.id));
+  for (const previousPage of previousManifest?.pages ?? []) {
+    if (!nonEmptyString(previousPage?.id) || currentPageIds.has(previousPage.id)) continue;
+    await rm(dirname(pageFilePath(args, previousPage.id)), { recursive: true, force: true });
+  }
 
   return { storage: "per-page", paths };
 }
