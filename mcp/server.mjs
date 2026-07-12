@@ -279,6 +279,10 @@ function isAiDraftHolderShape(shape) {
   return shape?.typeName === "shape" && shape.meta?.cowartAiDraftHolder === true;
 }
 
+function isAiSlidesShape(shape) {
+  return shape?.typeName === "shape" && shape.meta?.cowartAiSlides === true;
+}
+
 function isCowartHtmlDraftShape(shape) {
   return shape?.typeName === "shape" && shape.type === "embed" && (
     shape.meta?.cowartHtmlDraft === true ||
@@ -593,21 +597,35 @@ async function insertCowartHtmlDraft(args = {}) {
   const anchorBounds = draftShape ? pageBoundsForShape(store, draftShape) : null;
   const shouldUpdateExistingDraft = args.updateExistingDraft !== false && isCowartHtmlDraftShape(draftShape) && anchorBounds;
   const shouldTargetDraftHolder = args.matchAnchor !== false && isAiDraftHolderShape(draftShape) && anchorBounds;
+  const shouldTargetAiSlides = isAiSlidesShape(draftShape);
   const shouldReplaceDraftHolder = shouldTargetDraftHolder && args.replaceDraftHolder !== false;
   const matchAnchor = args.matchAnchor !== false && anchorBounds;
   const width = shouldUpdateExistingDraft || shouldTargetDraftHolder
     ? anchorBounds.w
-    : finiteNumber(args.displayWidth, matchAnchor ? anchorBounds.w : 512);
+    : finiteNumber(args.displayWidth, shouldTargetAiSlides ? 1024 : matchAnchor ? anchorBounds.w : 512);
   const height = shouldUpdateExistingDraft || shouldTargetDraftHolder
     ? anchorBounds.h
-    : finiteNumber(args.displayHeight, matchAnchor ? anchorBounds.h : 683);
+    : finiteNumber(args.displayHeight, shouldTargetAiSlides ? 576 : matchAnchor ? anchorBounds.h : 683);
   const margin = Math.max(0, finiteNumber(args.margin, 40));
   const placement = ["right", "left", "below"].includes(args.placement) ? args.placement : "right";
   let parentId = draftShape?.parentId && store[draftShape.parentId] ? draftShape.parentId : pageId;
   let rotation = 0;
   let bounds = null;
 
-  if (shouldUpdateExistingDraft || shouldTargetDraftHolder) {
+  if (shouldTargetAiSlides) {
+    const padding = Math.max(0, finiteNumber(draftShape.meta?.cowartAiSlidesPadding, 12));
+    const gap = Math.max(0, finiteNumber(draftShape.meta?.cowartAiSlidesGap, 32));
+    const slideItems = Object.values(store)
+      .filter((record) => record?.typeName === "shape" && record.parentId === draftShape.id)
+      .sort((a, b) => String(a.index || "").localeCompare(String(b.index || "")));
+    const nextX = slideItems.reduce(
+      (cursor, item) => Math.max(cursor, finiteNumber(item.x, padding) + finiteNumber(item.props?.w, 0) + gap),
+      padding,
+    );
+    parentId = draftShape.id;
+    rotation = 0;
+    bounds = { x: nextX, y: padding, w: width, h: height };
+  } else if (shouldUpdateExistingDraft || shouldTargetDraftHolder) {
     parentId = draftShape.parentId && store[draftShape.parentId] ? draftShape.parentId : pageId;
     rotation = finiteNumber(draftShape.rotation, 0);
     bounds = {
@@ -676,6 +694,9 @@ async function insertCowartHtmlDraft(args = {}) {
   }
   if (shouldReplaceDraftHolder && draftShapeId) {
     shapeMeta.cowartReplacedAiDraftHolder = true;
+  }
+  if (shouldTargetAiSlides && draftShapeId && !shapeMeta.cowartAiSlidesParentShapeId) {
+    shapeMeta.cowartAiSlidesParentShapeId = draftShapeId;
   }
 
   const shapeRecord = {
@@ -1145,7 +1166,7 @@ function registerCowartImageTools(mcpServer) {
     {
       title: "Insert Cowart HTML Draft",
       description:
-        "Save a single-file HTML draft into the current Cowart page's assets folder, update a targeted existing HTML draft in place, or replace a targeted AI Html holder by default.",
+        "Save a single-file HTML draft into the current Cowart page's assets folder, update a targeted existing HTML draft in place, replace a targeted AI HTML holder, or append a 16:9 HTML page inside an AI Slides frame.",
       inputSchema: {
         ...projectArgsSchema,
         htmlContent: z.string().optional(),

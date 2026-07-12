@@ -60,7 +60,7 @@ import {
 import { getAssetUrlsByImport } from '@tldraw/assets/imports.vite'
 import { AllSelection } from '@tiptap/pm/state'
 import html2canvas from 'html2canvas'
-import { ChevronLeft, ChevronRight, Play, X } from 'lucide-react'
+import { Check, ChevronDown, ChevronLeft, ChevronRight, Play, X } from 'lucide-react'
 import 'tldraw/tldraw.css'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import aiHtmlToolIconRaw from './assets/ai-html.svg?raw'
@@ -204,6 +204,13 @@ const AI_DRAFT_GENERATION_PROMPT_PREFIX = [
   '这不是图片生成任务：不要生成 bitmap，不要调用 insert_cowart_image。',
   '请生成完整可运行的 HTML 文档，CSS 和 JS 尽量内联，适合直接放进 iframe 预览。',
   '完成后调用 Cowart MCP 工具 insert_cowart_html_draft，把 htmlContent 写入当前 page 的 canvas/pages/<page-id>/assets/，并替换对应 AI HTML 框为 HTML embed。'
+].join('\n')
+const AI_SLIDES_GENERATION_PROMPT_PREFIX = [
+  '[@cowart](plugin://cowart@personal) 生成 AI Slides',
+  '',
+  '请根据下面的 prompt 生成一套视觉与叙事连贯的 AI Slides。',
+  '每一页都必须是完整、独立、可运行的单文件 HTML；CSS 和 JS 尽量内联。',
+  '每页画布固定为 1024 x 576（16:9），不要生成 bitmap，不要调用 insert_cowart_image。'
 ].join('\n')
 const aiImageToolIconSvg = aiImageToolIconRaw.replaceAll('black', 'currentColor')
 const aiImageToolIcon = (
@@ -732,6 +739,24 @@ function layoutAiSlides(editor, slidesShapeId) {
 function layoutAllAiSlides(editor) {
   for (const shape of editor.getCurrentPageShapes()) {
     if (isAiSlidesShape(shape)) layoutAiSlides(editor, shape.id)
+  }
+}
+
+function adoptGeneratedAiSlidesItems(editor) {
+  const itemsBySlides = new Map()
+  for (const shape of editor.getCurrentPageShapes()) {
+    if (!isAiSlidesItemShape(shape)) continue
+    const slidesShapeId = shape.meta?.cowartAiSlidesParentShapeId
+    const slidesShape = slidesShapeId ? editor.getShape(slidesShapeId) : null
+    if (!isAiSlidesShape(slidesShape) || shape.parentId === slidesShapeId) continue
+
+    const itemIds = itemsBySlides.get(slidesShapeId) ?? []
+    itemIds.push(shape.id)
+    itemsBySlides.set(slidesShapeId, itemIds)
+  }
+
+  for (const [slidesShapeId, itemIds] of itemsBySlides) {
+    editor.reparentShapes(itemIds, slidesShapeId)
   }
 }
 
@@ -2017,6 +2042,31 @@ function buildAiDraftGenerationPrompt({ holderShape, userPrompt, references, ref
   ].join('\n')
 }
 
+function buildAiSlidesGenerationPrompt({ slidesShape, pageCount, userPrompt, references, referenceAttached }) {
+  const referenceLines = aiImageReferenceLines({ references, referenceAttached })
+
+  return [
+    AI_SLIDES_GENERATION_PROMPT_PREFIX,
+    '',
+    `Cowart AI Slides frame: ${slidesShape.id}`,
+    `Required page count: exactly ${pageCount}.`,
+    'Create the deck as a coherent sequence with a clear opening, development, and conclusion.',
+    ...referenceLines,
+    '',
+    'Required tool calls after generating the HTML pages:',
+    `- Call insert_cowart_html_draft exactly ${pageCount} times, once per page, in page order.`,
+    `- For every call set draftShapeId to "${slidesShape.id}".`,
+    '- Set replaceDraftHolder: false, updateExistingDraft: false, matchAnchor: false, displayWidth: 1024, and displayHeight: 576.',
+    `- Set shapeMeta.cowartAiSlidesParentShapeId to "${slidesShape.id}".`,
+    `- Set shapeMeta.cowartAiSlidesGeneratedPageCount to ${pageCount}, and shapeMeta.cowartAiSlidesGeneratedPage to the 1-based page number.`,
+    '- Use unique ordered file names such as slide-01.html, slide-02.html, and so on.',
+    '- Do not replace or delete the AI Slides frame.',
+    '',
+    'Prompt:',
+    userPrompt.trim()
+  ].join('\n')
+}
+
 function readFileAsDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
@@ -2146,6 +2196,63 @@ async function sendAiDraftGenerationRequest({ holderShape, userPrompt, reference
         cowartAiDraftReference: true,
         cowartAiDraftReferenceIndex: index + 1,
         cowartAiDraftHolderShapeId: holderShape.id,
+        cowartReferenceFileName: reference.file.name || null,
+        cowartReferenceAssetPath: reference.savedReference?.assetPath || null
+      }))
+    }
+  }
+
+  return sender({ prompt, content })
+}
+
+async function sendAiSlidesGenerationRequest({ slidesShape, pageCount, userPrompt, referenceFiles = [] }) {
+  const sender = followUpSender()
+  if (!sender) {
+    throw new Error('当前 Cowart 画布没有可用的 Codex MCP 消息桥。')
+  }
+
+  const imageReferences = referenceFiles.slice(0, AI_IMAGE_REFERENCE_MAX_FILES)
+  const referenceAttached = Boolean(imageReferences.length && supportsCowartMessageImages())
+  const references = []
+
+  for (const [index, referenceFile] of imageReferences.entries()) {
+    const referenceDataUrl = await readFileAsDataUrl(referenceFile)
+    let savedReference = null
+    if (hasCowartWidgetBridge()) {
+      try {
+        savedReference = await saveCowartReferenceImage({
+          holderShapeId: slidesShape.id,
+          fileName: referenceFile.name || `slides-reference-${index + 1}.png`,
+          dataUrl: referenceDataUrl,
+          mimeType: referenceFile.type || undefined
+        })
+      } catch (error) {
+        if (!referenceAttached) {
+          throw new Error(`参考图无法保存到 Cowart 本地 assets：${error instanceof Error ? error.message : String(error)}`)
+        }
+        console.warn('Cowart slides reference image could not be saved; relying on direct image attachment.', error)
+      }
+    } else if (!referenceAttached) {
+      throw new Error('当前 Codex host 没有声明支持图片附件，也没有可用的 Cowart MCP 文件保存桥。')
+    }
+    references.push({ file: referenceFile, dataUrl: referenceDataUrl, savedReference })
+  }
+
+  const prompt = buildAiSlidesGenerationPrompt({
+    slidesShape,
+    pageCount,
+    userPrompt,
+    references,
+    referenceAttached
+  })
+  const content = [{ type: 'text', text: prompt }]
+
+  if (referenceAttached) {
+    for (const [index, reference] of references.entries()) {
+      content.push(dataUrlToImageContent(reference.dataUrl, {
+        cowartAiSlidesReference: true,
+        cowartAiSlidesReferenceIndex: index + 1,
+        cowartAiSlidesShapeId: slidesShape.id,
         cowartReferenceFileName: reference.file.name || null,
         cowartReferenceAssetPath: reference.savedReference?.assetPath || null
       }))
@@ -2655,6 +2762,7 @@ function CowartCanvasOverlay() {
     <>
       <CowartAiImageGenerationPanel />
       <CowartAiDraftGenerationPanel />
+      <CowartAiSlidesGenerationPanel />
       <CowartSlidesPresentationOverlay />
     </>
   )
@@ -3624,6 +3732,321 @@ function CowartAiDraftGenerationPanel() {
           >
             <span>{isSending ? '发送中' : '发送'}</span>
           </button>
+        </div>
+      </form>
+    </div>
+  )
+}
+
+function CowartAiSlidesGenerationPanel() {
+  const editor = useEditor()
+  const selectedTarget = useValue(
+    'selected empty ai slides generation panel target',
+    () => {
+      const shape = editor.getOnlySelectedShape()
+      if (!isAiSlidesShape(shape) || getAiSlidesItems(editor, shape.id).length > 0) return null
+
+      editor.getCamera()
+      editor.getViewportScreenBounds()
+
+      const layout = getAiImageGenerationPanelLayout(editor, shape.id)
+      return layout ? { shape, layout } : null
+    },
+    [editor]
+  )
+  const fileInputRef = useRef(null)
+  const customPageCountInputRef = useRef(null)
+  const pageCountMenuRef = useRef(null)
+  const [promptValue, setPromptValue] = useState('')
+  const [referenceFiles, setReferenceFiles] = useState([])
+  const [referencePreviews, setReferencePreviews] = useState([])
+  const [pageCountMode, setPageCountMode] = useState('5')
+  const [customPageCount, setCustomPageCount] = useState('5')
+  const [isPageCountMenuOpen, setIsPageCountMenuOpen] = useState(false)
+  const [status, setStatus] = useState('idle')
+  const [errorMessage, setErrorMessage] = useState('')
+
+  useEffect(() => {
+    setStatus('idle')
+    setErrorMessage('')
+    setPageCountMode('5')
+    setCustomPageCount('5')
+    setIsPageCountMenuOpen(false)
+  }, [selectedTarget?.shape.id])
+
+  useEffect(() => {
+    if (!isPageCountMenuOpen) return undefined
+
+    function handlePointerDown(event) {
+      if (!pageCountMenuRef.current?.contains(event.target)) setIsPageCountMenuOpen(false)
+    }
+    function handleKeyDown(event) {
+      if (event.key === 'Escape') setIsPageCountMenuOpen(false)
+    }
+
+    const doc = editor.getContainerDocument()
+    doc.addEventListener('pointerdown', handlePointerDown, true)
+    doc.addEventListener('keydown', handleKeyDown, true)
+    return () => {
+      doc.removeEventListener('pointerdown', handlePointerDown, true)
+      doc.removeEventListener('keydown', handleKeyDown, true)
+    }
+  }, [editor, isPageCountMenuOpen])
+
+  useEffect(() => {
+    if (pageCountMode !== 'custom') return
+    customPageCountInputRef.current?.focus()
+    customPageCountInputRef.current?.select()
+  }, [pageCountMode])
+
+  useEffect(() => {
+    if (status !== 'sent') return undefined
+    const timer = window.setTimeout(() => setStatus('idle'), AI_IMAGE_GENERATION_STATUS_RESET_MS)
+    return () => window.clearTimeout(timer)
+  }, [status])
+
+  useEffect(() => {
+    const previews = referenceFiles.map((file, index) => ({
+      file,
+      key: `${file.name}-${file.size}-${file.lastModified}-${index}`,
+      url: URL.createObjectURL(file)
+    }))
+    setReferencePreviews(previews)
+    return () => previews.forEach((preview) => URL.revokeObjectURL(preview.url))
+  }, [referenceFiles])
+
+  if (!selectedTarget) return null
+
+  const { shape, layout } = selectedTarget
+  const parsedCustomPageCount = Math.round(Number(customPageCount))
+  const pageCount = pageCountMode === 'custom'
+    ? clampNumber(Number.isFinite(parsedCustomPageCount) ? parsedCustomPageCount : 1, 1, 50)
+    : Number(pageCountMode)
+  const pageCountLabel = pageCountMode === 'custom' ? '自定义' : `${pageCountMode} 页`
+  const canSend = promptValue.trim().length > 0 || referenceFiles.length > 0
+  const isSending = status === 'sending'
+
+  function addReferenceFiles(files) {
+    const imageFiles = Array.from(files || []).filter((file) => file.type.startsWith('image/'))
+    const availableSlots = Math.max(0, AI_IMAGE_REFERENCE_MAX_FILES - referenceFiles.length)
+    if (!availableSlots) {
+      setStatus('error')
+      setErrorMessage(`最多支持 ${AI_IMAGE_REFERENCE_MAX_FILES} 张参考图。`)
+      return
+    }
+
+    setReferenceFiles((currentFiles) => [
+      ...currentFiles,
+      ...imageFiles.slice(0, availableSlots)
+    ].slice(0, AI_IMAGE_REFERENCE_MAX_FILES))
+    if (imageFiles.length > availableSlots) {
+      setStatus('error')
+      setErrorMessage(`最多支持 ${AI_IMAGE_REFERENCE_MAX_FILES} 张参考图。`)
+    } else {
+      setStatus('idle')
+      setErrorMessage('')
+    }
+  }
+
+  function handleReferenceChange(event) {
+    const selectedFiles = Array.from(event.target.files || [])
+    if (selectedFiles.some((file) => !file.type.startsWith('image/'))) {
+      setStatus('error')
+      setErrorMessage('请选择图片文件。')
+    } else {
+      addReferenceFiles(selectedFiles)
+    }
+    event.target.value = ''
+  }
+
+  function clearReferences() {
+    setReferenceFiles([])
+    if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+
+  function removeReferenceAt(indexToRemove) {
+    setReferenceFiles((currentFiles) => currentFiles.filter((_file, index) => index !== indexToRemove))
+    if (status === 'error') {
+      setStatus('idle')
+      setErrorMessage('')
+    }
+  }
+
+  async function handleSubmit(event) {
+    event?.preventDefault()
+    if (!canSend || isSending) return
+
+    setStatus('sending')
+    setErrorMessage('')
+    try {
+      await sendAiSlidesGenerationRequest({
+        slidesShape: shape,
+        pageCount,
+        userPrompt: promptValue,
+        referenceFiles
+      })
+      setPromptValue('')
+      clearReferences()
+      setStatus('sent')
+    } catch (error) {
+      console.error(error)
+      setStatus('error')
+      setErrorMessage(error instanceof Error ? error.message : '发送失败，请重试。')
+    }
+  }
+
+  function handlePromptKeyDown(event) {
+    stopEditorOverlayEvent(event)
+    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') handleSubmit(event)
+  }
+
+  function handlePromptPaste(event) {
+    const imageFiles = clipboardImageFiles(event)
+    if (!imageFiles.length) return
+    event.preventDefault()
+    stopEditorOverlayEvent(event)
+    addReferenceFiles(imageFiles)
+  }
+
+  return (
+    <div className="cowart-ai-generation-overlay" aria-hidden={false}>
+      <form
+        aria-label="AI Slides 生成"
+        className="cowart-ai-generation-panel cowart-ai-slides-generation-panel"
+        data-status={status}
+        onClick={stopEditorOverlayEvent}
+        onDoubleClick={stopEditorOverlayEvent}
+        onKeyDown={stopEditorOverlayEvent}
+        onPointerDown={stopEditorOverlayEvent}
+        onSubmit={handleSubmit}
+        style={{
+          left: `${layout.left}px`,
+          top: `${layout.top}px`,
+          width: `${layout.width}px`
+        }}
+      >
+        <div className="cowart-ai-generation-reference-row">
+          <div className="cowart-ai-generation-reference-strip">
+            {referencePreviews.map((preview, index) => (
+              <div className="cowart-ai-generation-reference-preview" key={preview.key}>
+                <img alt={`参考图 ${index + 1}`} src={preview.url} />
+                <button aria-label={`移除参考图 ${index + 1}`} onClick={() => removeReferenceAt(index)} type="button">
+                  <TldrawUiButtonIcon icon="cross-2" small />
+                </button>
+              </div>
+            ))}
+            {referenceFiles.length < AI_IMAGE_REFERENCE_MAX_FILES && (
+              <button
+                aria-label="选择参考图"
+                className="cowart-ai-generation-reference-button"
+                onClick={() => fileInputRef.current?.click()}
+                type="button"
+              >
+                <TldrawUiButtonIcon icon="tool-media" small />
+                <span>参考图</span>
+              </button>
+            )}
+          </div>
+          <input
+            ref={fileInputRef}
+            accept="image/*"
+            className="cowart-ai-generation-file-input"
+            multiple
+            onChange={handleReferenceChange}
+            type="file"
+          />
+        </div>
+
+        <textarea
+          aria-label="自定义 Slides prompt"
+          className="cowart-ai-generation-prompt"
+          disabled={isSending}
+          onChange={(event) => {
+            setPromptValue(event.target.value)
+            if (status === 'error') {
+              setStatus('idle')
+              setErrorMessage('')
+            }
+          }}
+          onKeyDown={handlePromptKeyDown}
+          onPaste={handlePromptPaste}
+          placeholder="描述你想生成的 Slides，或是图片或者 HTML 放进来..."
+          rows={3}
+          value={promptValue}
+        />
+
+        <div className="cowart-ai-generation-footer">
+          <div className="cowart-ai-generation-status" aria-live="polite">
+            {status === 'sending' ? '正在发送' : status === 'sent' ? '已发送' : errorMessage}
+          </div>
+          <div className="cowart-ai-slides-generation-actions">
+            <div className="cowart-ai-slides-page-count-menu" ref={pageCountMenuRef}>
+              <button
+                aria-expanded={isPageCountMenuOpen}
+                aria-haspopup="listbox"
+                className="cowart-ai-slides-page-count-trigger"
+                disabled={isSending}
+                onClick={() => setIsPageCountMenuOpen((isOpen) => !isOpen)}
+                type="button"
+              >
+                <span className="cowart-ai-slides-page-count-label">页数</span>
+                <span>{pageCountLabel}</span>
+                <ChevronDown aria-hidden="true" size={14} strokeWidth={2} />
+              </button>
+              {isPageCountMenuOpen && (
+                <div aria-label="Slides 页数" className="cowart-ai-slides-page-count-popover" role="listbox">
+                  {[
+                    ['3', '3 页'],
+                    ['5', '5 页'],
+                    ['10', '10 页'],
+                    ['custom', '自定义']
+                  ].map(([value, label]) => (
+                    <button
+                      aria-selected={pageCountMode === value}
+                      className="cowart-ai-slides-page-count-option"
+                      key={value}
+                      onClick={() => {
+                        setPageCountMode(value)
+                        setIsPageCountMenuOpen(false)
+                      }}
+                      role="option"
+                      type="button"
+                    >
+                      <Check
+                        aria-hidden="true"
+                        className={pageCountMode === value ? 'is-visible' : ''}
+                        size={14}
+                        strokeWidth={2.25}
+                      />
+                      <span>{label}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            {pageCountMode === 'custom' && (
+              <input
+                ref={customPageCountInputRef}
+                aria-label="自定义 Slides 页数"
+                className="cowart-ai-slides-custom-page-count"
+                disabled={isSending}
+                inputMode="numeric"
+                max="50"
+                min="1"
+                onChange={(event) => setCustomPageCount(event.target.value)}
+                type="number"
+                value={customPageCount}
+              />
+            )}
+            <button
+              aria-label="发送 Slides 生成请求"
+              className="cowart-ai-generation-send"
+              disabled={!canSend || isSending}
+              type="submit"
+            >
+              <span>{isSending ? '发送中' : '发送'}</span>
+            </button>
+          </div>
         </div>
       </form>
     </div>
@@ -4663,6 +5086,7 @@ export default function App() {
           editor.run(
             () => {
               normalizeAiDraftHolderLabels(editor)
+              adoptGeneratedAiSlidesItems(editor)
               layoutAllAiSlides(editor)
             },
             { history: 'ignore' }
