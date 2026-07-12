@@ -167,6 +167,7 @@ const ANNOTATION_EDIT_NEAR_MARGIN_MAX = 720
 const ANNOTATION_EDIT_RELATED_TEXT_MARGIN = 120
 const ANNOTATION_EDIT_STATUS_RESET_MS = 2200
 const ANNOTATION_EDIT_COLORS = new Set(['red', 'yellow', 'orange'])
+const HTML_DRAFT_CAPTURE_DELAY_MS = 2000
 const HTML_DRAFT_DOM_EDIT_LABEL = '编辑文本'
 const HTML_DRAFT_DOM_EDIT_DONE_LABEL = '完成编辑'
 const HTML_DRAFT_ANNOTATION_EDIT_LABEL = '按标注修改'
@@ -1640,6 +1641,25 @@ async function waitForHtmlDraftAssets(iframeDocument) {
   ])
 }
 
+function waitForHtmlDraftPaint(iframeDocument) {
+  const frameWindow = iframeDocument.defaultView
+  if (!frameWindow?.requestAnimationFrame) {
+    return new Promise((resolve) => window.setTimeout(resolve, 34))
+  }
+
+  return new Promise((resolve) => {
+    frameWindow.requestAnimationFrame(() => frameWindow.requestAnimationFrame(resolve))
+  })
+}
+
+async function waitForHtmlDraftCaptureReady(iframeDocument) {
+  await Promise.all([
+    waitForHtmlDraftAssets(iframeDocument),
+    new Promise((resolve) => window.setTimeout(resolve, HTML_DRAFT_CAPTURE_DELAY_MS))
+  ])
+  await waitForHtmlDraftPaint(iframeDocument)
+}
+
 function loadRasterImage(src) {
   return new Promise((resolve, reject) => {
     const image = new Image()
@@ -1678,7 +1698,7 @@ async function renderCowartHtmlDraftCanvas(shape, pixelRatio) {
   }
 
   const iframeDocument = await waitForHtmlDraftDocument(shape.id)
-  await waitForHtmlDraftAssets(iframeDocument)
+  await waitForHtmlDraftCaptureReady(iframeDocument)
 
   const width = Math.max(1, Number(shape.props.w) || AI_IMAGE_HOLDER_DEFAULT_W)
   const height = Math.max(1, Number(shape.props.h) || AI_IMAGE_HOLDER_DEFAULT_H)
@@ -1690,10 +1710,18 @@ async function renderCowartHtmlDraftCanvas(shape, pixelRatio) {
     logging: false,
     onclone(clonedDocument) {
       clonedDocument.querySelectorAll('script').forEach((script) => script.remove())
+      for (const animation of clonedDocument.getAnimations?.() || []) {
+        try {
+          const timing = animation.effect?.getComputedTiming?.()
+          if (Number.isFinite(timing?.endTime)) animation.finish()
+        } catch (_error) {
+          // Infinite or detached animations cannot be finished; pausing below still stabilizes them.
+        }
+      }
       const captureStyle = clonedDocument.createElement('style')
       captureStyle.textContent = `
         html, body { width: ${width}px !important; height: ${height}px !important; }
-        *, *::before, *::after { animation-play-state: paused !important; caret-color: transparent !important; }
+        *, *::before, *::after { animation-play-state: paused !important; caret-color: transparent !important; transition: none !important; }
       `
       clonedDocument.head?.append(captureStyle)
     },
