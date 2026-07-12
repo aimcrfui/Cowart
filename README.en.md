@@ -9,8 +9,10 @@ Cowart is a native infinite-canvas widget plugin for Codex. It brings a tldraw-p
 - Open a native tldraw infinite-canvas widget from Codex; normal use no longer opens a local page through a web browser or the in-app browser.
 - Persist canvas pages and image assets in the active project directory.
 - Create AI image slots on the canvas, enter a prompt directly, choose reference images, and let Codex generate an image that replaces the selected slot at the same position and aspect ratio.
+- Create a 16:9 `AI HTML` slot, generate a runnable single-file HTML page from a prompt and reference images, and embed it directly on the canvas for further editing and iteration.
+- Create `AI Slides` to organize images and HTML into a deck, or ask Codex to generate a specified number of coordinated 16:9 HTML pages; preview the deck with thumbnails or play it fullscreen.
 - After annotating an image, submit the annotation screenshot directly from the canvas so Codex can generate a clean revised image beside the original.
-- Use Cowart MCP tools to read selection state, save the canvas, insert images, and save page-local assets.
+- Use Cowart MCP tools to read selection state, save the canvas, insert images or HTML, and save page-local assets.
 
 ## Installation
 
@@ -102,6 +104,22 @@ canvas/pages/<page-id>/assets/
 Cowart sends the prompt, reference images, and selected `AI 图片` slot dimensions to Codex. Codex generates an image for that position and aspect ratio, then replaces the `AI 图片` slot with a normal image shape.
 
 ![Generate and insert a new image with Cowart](assets/generate-image.png)
+
+### Generate AI HTML
+
+1. Create and select an `AI HTML` slot from the toolbar. New slots default to `1024 × 576` (16:9).
+2. Enter a prompt in the generation panel below the slot. You can also choose or paste one or more reference images.
+3. Send the request. Codex generates a complete runnable single-file HTML page and embeds it into the selected `AI HTML` slot.
+
+The generated HTML is stored as an embedded canvas page in the current page's `assets/` directory. Select it to download a rendered image, edit text directly, continue revising the HTML with canvas annotations, or generate an image from the HTML and its annotations.
+
+### Create And Present AI Slides
+
+1. Create `AI Slides` from the toolbar. The default frame is `1048 × 600`, providing room for one `1024 × 576` (16:9) page with `12px` padding on every side.
+2. Drag images or HTML from the canvas into the Slides frame. You can also copy an image, select the Slides frame, and paste it; items are arranged horizontally in order.
+3. Selecting an empty Slides frame opens its generation panel. Describe the deck, optionally add reference images, and choose 3, 5, 10, or a custom number of pages. The default is 5 pages.
+4. After you send the request, Codex generates the requested number of visually and narratively coordinated standalone 16:9 HTML pages and appends them to the current Slides frame. The generation panel is hidden once the frame contains content.
+5. Select the Slides frame and click `演示 Slides` to preview and navigate with the thumbnail sidebar or enter fullscreen playback. In fullscreen, use the arrow keys, Space, or click static slide content to advance. Buttons, links, and form controls inside HTML remain interactive, and the playback controls stay at the top.
 
 ### Generate From An Annotation Screenshot
 

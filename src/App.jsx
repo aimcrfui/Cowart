@@ -212,6 +212,14 @@ const AI_SLIDES_GENERATION_PROMPT_PREFIX = [
   '每一页都必须是完整、独立、可运行的单文件 HTML；CSS 和 JS 尽量内联。',
   '每页画布固定为 1024 x 576（16:9），不要生成 bitmap，不要调用 insert_cowart_image。'
 ].join('\n')
+const AI_SLIDES_ANNOTATION_EDIT_PROMPT = [
+  '[@cowart](plugin://cowart@personal) 按标注修改 AI Slides',
+  '',
+  '请根据 Cowart 截图中的原 AI Slides 和周围标注，生成一套修改后的新 Slides。',
+  '原 AI Slides 和标注必须保持不动；新的目标 AI Slides 已经创建在原 Slides 下方，请只把修改后的页面加入新 Slides。',
+  '每一页都必须是完整、独立、可运行的单文件 HTML；CSS 和 JS 尽量内联。',
+  '每页画布固定为 1024 x 576（16:9），不要生成 bitmap，不要调用 insert_cowart_image。'
+].join('\n')
 const aiImageToolIconSvg = aiImageToolIconRaw.replaceAll('black', 'currentColor')
 const aiImageToolIcon = (
   <div
@@ -1114,6 +1122,15 @@ function collectHtmlDraftAnnotationShapeIds(editor, draftShapeId) {
   )
 }
 
+function collectAiSlidesAnnotationShapeIds(editor, slidesShapeId) {
+  return collectAnnotationTargetShapeIds(
+    editor,
+    slidesShapeId,
+    isAiSlidesShape,
+    '请选择一个已有内容的 AI Slides。'
+  )
+}
+
 function buildAnnotationEditPrompt({ imageShapeId, shapeIds, exportWidth, exportHeight, screenshotAsset }) {
   const annotationCount = Math.max(0, shapeIds.length - 1)
   const lines = [
@@ -1817,6 +1834,221 @@ async function exportCowartHtmlDraftAnnotationScreenshot(editor, draftShapeId) {
     width: canvas.width,
     height: canvas.height,
     shapeIds
+  }
+}
+
+async function exportCowartSlidesAnnotationScreenshot(editor, slidesShapeId) {
+  const shapeIds = collectAiSlidesAnnotationShapeIds(editor, slidesShapeId)
+  const slidesShape = editor.getShape(slidesShapeId)
+  const rawBounds = editor.getShapesPageBounds(shapeIds)
+  if (!slidesShape || !rawBounds) throw new Error('无法计算 AI Slides 标注截图范围。')
+
+  const exportBounds = expandBox(rawBounds, ANNOTATION_EDIT_EXPORT_PADDING)
+  const pixelRatio = getAnnotationEditExportPixelRatio(exportBounds)
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, Math.round(exportBounds.w * pixelRatio))
+  canvas.height = Math.max(1, Math.round(exportBounds.h * pixelRatio))
+  const context = canvas.getContext('2d')
+  if (!context) throw new Error('浏览器无法创建 AI Slides 标注截图。')
+
+  context.fillStyle = '#ffffff'
+  context.fillRect(0, 0, canvas.width, canvas.height)
+
+  const slidesCapture = await editor.toImageDataUrl([slidesShapeId], {
+    bounds: exportBounds,
+    background: false,
+    darkMode: false,
+    format: 'png',
+    padding: 0,
+    pixelRatio
+  })
+  context.drawImage(await loadRasterImage(slidesCapture.url), 0, 0, canvas.width, canvas.height)
+
+  for (const item of getAiSlidesItems(editor, slidesShapeId)) {
+    if (!isCowartHtmlDraftEmbedShape(item)) continue
+    const htmlCapture = await renderCowartHtmlDraftCanvas(item, pixelRatio)
+    const pageTransform = editor.getShapePageTransform(item.id)
+    if (!pageTransform) continue
+    context.setTransform(
+      pixelRatio * pageTransform.a,
+      pixelRatio * pageTransform.b,
+      pixelRatio * pageTransform.c,
+      pixelRatio * pageTransform.d,
+      pixelRatio * (pageTransform.e - exportBounds.x),
+      pixelRatio * (pageTransform.f - exportBounds.y)
+    )
+    context.drawImage(
+      htmlCapture.canvas,
+      0,
+      0,
+      Number(item.props.w) || htmlCapture.displayWidth,
+      Number(item.props.h) || htmlCapture.displayHeight
+    )
+  }
+
+  const annotationShapeIds = shapeIds.filter((shapeId) => shapeId !== slidesShapeId)
+  if (annotationShapeIds.length) {
+    const annotationOverlay = await editor.toImageDataUrl(annotationShapeIds, {
+      bounds: exportBounds,
+      background: false,
+      darkMode: false,
+      format: 'png',
+      padding: 0,
+      pixelRatio
+    })
+    context.setTransform(1, 0, 0, 1, 0, 0)
+    context.drawImage(await loadRasterImage(annotationOverlay.url), 0, 0, canvas.width, canvas.height)
+  }
+
+  return {
+    url: canvas.toDataURL('image/png'),
+    width: canvas.width,
+    height: canvas.height,
+    shapeIds
+  }
+}
+
+function aiSlidesAnnotationScreenshotFileName() {
+  const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')
+  return `ai-slides-annotation-edit-${timestamp}.png`
+}
+
+function createAiSlidesBelowSource(editor, sourceSlidesShape) {
+  const sourceBounds = editor.getShapePageBounds(sourceSlidesShape.id)
+  if (!sourceBounds) throw new Error('无法读取原 AI Slides 的画布位置。')
+
+  const width = Math.max(AI_SLIDES_DEFAULT_W, Number(sourceSlidesShape.props?.w) || AI_SLIDES_DEFAULT_W)
+  const height = Math.max(AI_SLIDES_DEFAULT_H, Number(sourceSlidesShape.props?.h) || AI_SLIDES_DEFAULT_H)
+  const margin = 80
+  const pageId = editor.getCurrentPageId()
+  const obstacles = editor
+    .getCurrentPageShapes()
+    .filter((shape) => shape.parentId === pageId && shape.id !== sourceSlidesShape.id)
+    .map((shape) => editor.getShapePageBounds(shape.id))
+    .filter(Boolean)
+
+  let x = sourceBounds.x
+  let y = sourceBounds.maxY + margin
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const candidate = new Box(x, y, width, height)
+    if (!obstacles.some((bounds) => candidate.collides(bounds))) break
+    y += height + margin
+  }
+
+  const slidesShapeId = createShapeId()
+  createAiSlidesShape(editor, slidesShapeId, {
+    x,
+    y,
+    meta: {
+      cowartGeneratedFromAiSlidesAnnotation: true,
+      cowartSourceAiSlidesShapeId: sourceSlidesShape.id
+    },
+    props: {
+      w: width,
+      h: height,
+      name: AI_SLIDES_LABEL
+    }
+  })
+  return slidesShapeId
+}
+
+function buildAiSlidesAnnotationEditPrompt({
+  sourceSlidesShape,
+  targetSlidesShapeId,
+  sourceItems,
+  exportResult,
+  screenshotAsset
+}) {
+  const pageCount = sourceItems.length
+  const annotationCount = Math.max(0, exportResult.shapeIds.length - 1)
+  const sourcePageLines = sourceItems.flatMap((item, index) => {
+    if (isCowartHtmlDraftEmbedShape(item)) {
+      const assetPath = getCowartHtmlDraftLocalPath(item)
+      return [`${index + 1}. HTML shape ${item.id}${assetPath ? ` — ${assetPath}` : ''}`]
+    }
+    return [`${index + 1}. Image shape ${item.id}`]
+  })
+
+  return [
+    AI_SLIDES_ANNOTATION_EDIT_PROMPT,
+    '',
+    `Cowart source AI Slides frame: ${sourceSlidesShape.id}`,
+    `Cowart target AI Slides frame below source: ${targetSlidesShapeId}`,
+    `Required page count: exactly ${pageCount}.`,
+    `Included annotation shapes: ${annotationCount}`,
+    `Screenshot size: ${exportResult.width}x${exportResult.height}`,
+    ...(screenshotAsset?.assetPath
+      ? [
+          `Annotation screenshot local path: ${screenshotAsset.assetPath}`,
+          'Use this screenshot as the authoritative visual reference and annotation brief.'
+        ]
+      : []),
+    'Source pages in order:',
+    ...sourcePageLines,
+    '',
+    'Required tool calls after generating the revised HTML pages:',
+    `- Call insert_cowart_html_draft exactly ${pageCount} times, once per page, in page order.`,
+    `- For every call set draftShapeId to "${targetSlidesShapeId}".`,
+    '- Set replaceDraftHolder: false, updateExistingDraft: false, matchAnchor: false, displayWidth: 1024, and displayHeight: 576.',
+    `- Set shapeMeta.cowartAiSlidesParentShapeId to "${targetSlidesShapeId}".`,
+    `- Set shapeMeta.cowartAiSlidesGeneratedFromAnnotation to true and shapeMeta.cowartAiSlidesSourceShapeId to "${sourceSlidesShape.id}".`,
+    `- Set shapeMeta.cowartAiSlidesGeneratedPageCount to ${pageCount}, and shapeMeta.cowartAiSlidesGeneratedPage to the 1-based page number.`,
+    '- Use unique ordered file names such as revised-slide-01.html, revised-slide-02.html, and so on.',
+    '- Keep the source Slides, source page assets, and annotations unchanged.',
+    '- The target Slides already exists below the source; do not create another frame and do not place pages beside the source.'
+  ].join('\n')
+}
+
+async function sendAiSlidesAnnotationEditRequest(editor, slidesShapeId) {
+  const sender = followUpSender()
+  if (!sender) throw new Error('当前 Cowart 画布没有可用的 Codex MCP 消息桥。')
+
+  const sourceSlidesShape = editor.getShape(slidesShapeId)
+  const sourceItems = getAiSlidesItems(editor, slidesShapeId)
+  if (!isAiSlidesShape(sourceSlidesShape) || !sourceItems.length) {
+    throw new Error('请选择一个已有内容的 AI Slides。')
+  }
+
+  const exportResult = await exportCowartSlidesAnnotationScreenshot(editor, slidesShapeId)
+  const screenshotAsset = await saveCowartReferenceImage({
+    anchorShapeId: slidesShapeId,
+    fileName: aiSlidesAnnotationScreenshotFileName(),
+    dataUrl: exportResult.url,
+    mimeType: 'image/png'
+  })
+  const targetSlidesShapeId = createAiSlidesBelowSource(editor, sourceSlidesShape)
+
+  try {
+    const saveResult = await saveCowartCanvasSnapshot(editor.store.getStoreSnapshot(), {
+      protectImageRecords: true
+    })
+    if (saveResult?.ok === false) throw new Error(saveResult.message || '新的 AI Slides 保存失败。')
+
+    const prompt = buildAiSlidesAnnotationEditPrompt({
+      sourceSlidesShape,
+      targetSlidesShapeId,
+      sourceItems,
+      exportResult,
+      screenshotAsset
+    })
+    const content = [{ type: 'text', text: prompt }]
+    if (supportsCowartMessageImages()) {
+      content.push(
+        dataUrlToImageContent(exportResult.url, {
+          cowartAiSlidesAnnotation: true,
+          cowartSourceAiSlidesShapeId: slidesShapeId,
+          cowartTargetAiSlidesShapeId: targetSlidesShapeId,
+          cowartIncludedShapeIds: exportResult.shapeIds,
+          cowartAnnotationScreenshotPath: screenshotAsset.assetPath || null,
+          cowartAnnotationScreenshotFileName: screenshotAsset.fileName || null
+        })
+      )
+    }
+    return await sender({ prompt, content })
+  } catch (error) {
+    editor.deleteShapes([targetSlidesShapeId])
+    await saveCowartCanvasSnapshot(editor.store.getStoreSnapshot(), { protectImageRecords: true })
+    throw error
   }
 }
 
@@ -4306,6 +4538,11 @@ function CowartSlidesToolbar({ slidesShapeId }) {
     if (!fullBounds) return undefined
     return new Box(fullBounds.x, fullBounds.y, fullBounds.width, 0)
   }, [editor])
+  const hasContent = useValue(
+    'cowart selected ai slides has content',
+    () => getAiSlidesItems(editor, slidesShapeId).length > 0,
+    [editor, slidesShapeId]
+  )
 
   if (!showToolbar) return null
 
@@ -4334,7 +4571,60 @@ function CowartSlidesToolbar({ slidesShapeId }) {
         <Play aria-hidden="true" className="cowart-slides-play-icon" size={15} strokeWidth={2} />
         <span className="cowart-slides-toolbar-label">{AI_SLIDES_PRESENT_LABEL}</span>
       </TldrawUiToolbarButton>
+      {hasContent && <CowartSlidesAnnotationEditButton slidesShapeId={slidesShapeId} />}
     </TldrawUiContextualToolbar>
+  )
+}
+
+function CowartSlidesAnnotationEditButton({ slidesShapeId }) {
+  const editor = useEditor()
+  const [status, setStatus] = useState('idle')
+
+  useEffect(() => setStatus('idle'), [slidesShapeId])
+
+  useEffect(() => {
+    if (status === 'idle' || status === 'sending') return undefined
+    const timer = window.setTimeout(() => setStatus('idle'), ANNOTATION_EDIT_STATUS_RESET_MS)
+    return () => window.clearTimeout(timer)
+  }, [status])
+
+  async function handleClick() {
+    if (status === 'sending') return
+    setStatus('sending')
+    try {
+      await sendAiSlidesAnnotationEditRequest(editor, slidesShapeId)
+      setStatus('sent')
+    } catch (error) {
+      console.error(error)
+      setStatus('error')
+    }
+  }
+
+  const label = HTML_DRAFT_ANNOTATION_EDIT_LABEL
+  const title =
+    status === 'sending'
+      ? `${label}中`
+      : status === 'sent'
+        ? `${label}已发送`
+        : status === 'error'
+          ? `${label}失败，请重试`
+          : label
+  const icon = status === 'sent' ? 'check' : status === 'error' ? 'warning-triangle' : 'tool-highlight'
+
+  return (
+    <TldrawUiToolbarButton
+      aria-label={title}
+      className="cowart-slides-annotation-button"
+      data-status={status}
+      data-testid="tool.cowart-slides-annotation-edit"
+      disabled={status === 'sending'}
+      onClick={handleClick}
+      title={title}
+      type="icon"
+    >
+      <TldrawUiButtonIcon icon={icon} small />
+      <span className="cowart-slides-toolbar-label">{label}</span>
+    </TldrawUiToolbarButton>
   )
 }
 
