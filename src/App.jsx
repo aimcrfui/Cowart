@@ -150,6 +150,12 @@ const ANNOTATION_EDIT_PROMPT = [
   '- 不要把标注箭头、标注文字、蓝色选框或工具栏带进最终图片。',
   '- 保留原图和原标注不动，把新图放到原图旁边。'
 ].join('\n')
+const AI_HTML_LOCAL_ASSET_PROMPT_LINES = [
+  '- HTML 中不要引用 http:// 或 https:// 远程图片；Cowart widget 的 CSP 不允许 HTML iframe 直接加载这些资源。',
+  '- 如果 HTML 需要图片，先确定目标 shape 所在的 page，再把图片下载到当前项目的 canvas/pages/<page-id-without-page-prefix>/assets/ 目录。',
+  '- HTML 内必须使用 /page-assets/<page-id-without-page-prefix>/<filename> 引用这些本地图片；不要使用 file:// URL 或绝对文件路径。',
+  '- Cowart 会在将 HTML 放入 iframe 前，通过 read_cowart_page_asset 把 /page-assets/ 图片转换为 data: URL。'
+]
 const ANNOTATION_HTML_PROMPT = [
   '[@cowart](plugin://cowart@personal) 按标注生成 AI HTML',
   '',
@@ -158,6 +164,7 @@ const ANNOTATION_HTML_PROMPT = [
   '- 请把当前图片作为主体、构图和视觉风格参考，把标注文字作为 HTML 的修改或生成要求。',
   '- 这不是图片生成任务：不要调用 imagegen，不要调用 insert_cowart_image。',
   '- 请生成完整可运行的 HTML 文档，CSS 和 JS 尽量内联，适合直接放进 iframe 预览。',
+  ...AI_HTML_LOCAL_ASSET_PROMPT_LINES,
   '- 不要把标注箭头、标注文字、蓝色选框或工具栏写进 HTML。',
   '- 保留原图片和原标注不动，把新 HTML 草稿放到原图片右侧。'
 ].join('\n')
@@ -179,6 +186,7 @@ const HTML_DRAFT_ANNOTATION_EDIT_PROMPT = [
   '- 截图包含当前 HTML 草稿，以及草稿周围的标注箭头和标注文字。',
   '- 请把标注文字当作修改要求，并以现有 HTML 源文件为基础修改。',
   '- 不要生成 bitmap，不要调用 imagegen，也不要调用 insert_cowart_image。',
+  ...AI_HTML_LOCAL_ASSET_PROMPT_LINES,
   '- 不要把标注箭头、标注文字、蓝色选框或工具栏写进 HTML。',
   '- 保留原 HTML 草稿和原标注不动，创建一个修改后的新 HTML 草稿并放到原草稿右侧。',
   '- 不要覆盖原草稿的 HTML 文件、shape 或画布记录。'
@@ -213,6 +221,7 @@ const AI_DRAFT_GENERATION_PROMPT_PREFIX = [
   '不要在一个 AI HTML 里制作多页、分页、选项卡、轮播或幻灯片来代替多个独立 HTML；只有用户明确要求 AI Slides 时才使用多页 Slides 语义。',
   '这不是图片生成任务：不要生成 bitmap，不要调用 insert_cowart_image。',
   '请生成完整可运行的 HTML 文档，CSS 和 JS 尽量内联，适合直接放进 iframe 预览。',
+  ...AI_HTML_LOCAL_ASSET_PROMPT_LINES,
   '完成后调用 Cowart MCP 工具 insert_cowart_html_draft，把 htmlContent 写入当前 page 的 canvas/pages/<page-id>/assets/，并替换对应 AI HTML 框为 HTML embed。'
 ].join('\n')
 const AI_SLIDES_GENERATION_PROMPT_PREFIX = [
@@ -220,7 +229,8 @@ const AI_SLIDES_GENERATION_PROMPT_PREFIX = [
   '',
   '请根据下面的 prompt 生成一套视觉与叙事连贯的 AI Slides。',
   '每一页都必须是完整、独立、可运行的单文件 HTML；CSS 和 JS 尽量内联。',
-  '每页画布固定为 1024 x 576（16:9），不要生成 bitmap，不要调用 insert_cowart_image。'
+  '每页画布固定为 1024 x 576（16:9），不要生成 bitmap，不要调用 insert_cowart_image。',
+  ...AI_HTML_LOCAL_ASSET_PROMPT_LINES
 ].join('\n')
 const AI_SLIDES_ANNOTATION_EDIT_PROMPT = [
   '[@cowart](plugin://cowart@personal) 按标注修改 AI Slides',
@@ -228,6 +238,7 @@ const AI_SLIDES_ANNOTATION_EDIT_PROMPT = [
   '请根据 Cowart 截图中的原 AI Slides 和周围标注，生成一套修改后的新 Slides。',
   '原 AI Slides 和标注必须保持不动；新的目标 AI Slides 已经创建在原 Slides 下方，请只把修改后的页面加入新 Slides。',
   '每一页都必须是完整、独立、可运行的单文件 HTML；CSS 和 JS 尽量内联。',
+  ...AI_HTML_LOCAL_ASSET_PROMPT_LINES,
   '每页画布固定为 1024 x 576（16:9），不要生成 bitmap，不要调用 insert_cowart_image。'
 ].join('\n')
 const aiImageToolIconSvg = aiImageToolIconRaw.replaceAll('black', 'currentColor')
@@ -299,6 +310,37 @@ function buildCowartAssetUrls() {
 
 function isCowartLocalAssetUrl(src) {
   return typeof src === 'string' && (src.startsWith(PAGE_ASSETS_ROUTE) || src.startsWith(GLOBAL_ASSETS_ROUTE))
+}
+
+const COWART_HTML_DRAFT_LOCAL_IMAGE_PATTERN =
+  /(?:https?:\/\/cowart\.local)?(\/(?:page-assets|assets)\/[^"'()\s<>?#]+\.(?:apng|avif|gif|jpe?g|png|svg|webp))(?:[?#][^"'()\s<>]*)?/gi
+
+async function hydrateCowartHtmlDraftLocalImages(htmlContent) {
+  if (typeof htmlContent !== 'string' || !htmlContent || !hasCowartWidgetBridge()) return htmlContent
+
+  const references = new Map()
+  for (const match of htmlContent.matchAll(COWART_HTML_DRAFT_LOCAL_IMAGE_PATTERN)) {
+    references.set(match[0], match[1])
+  }
+  if (!references.size) return htmlContent
+
+  const replacements = await Promise.all(
+    Array.from(references.entries()).map(async ([reference, assetUrl]) => {
+      try {
+        const asset = await readCowartPageAsset(assetUrl)
+        if (!asset?.dataBase64 || !asset?.mimeType?.startsWith('image/')) return null
+        return [reference, `data:${asset.mimeType};base64,${asset.dataBase64}`]
+      } catch (error) {
+        console.warn(`Cowart could not hydrate HTML draft image ${assetUrl}.`, error)
+        return null
+      }
+    })
+  )
+
+  return replacements.filter(Boolean).reduce(
+    (result, [reference, dataUrl]) => result.split(reference).join(dataUrl),
+    htmlContent
+  )
 }
 
 function isCowartHtmlDraftAssetUrl(src) {
@@ -2970,6 +3012,7 @@ function CowartHtmlDraftEmbed({ shape }) {
         })
 
     htmlSourcePromise
+      .then((htmlContent) => hasCowartWidgetBridge() ? hydrateCowartHtmlDraftLocalImages(htmlContent) : htmlContent)
       .then((htmlContent) => {
         if (isDisposed) return
         setHtmlSource(htmlContent)
@@ -3325,7 +3368,15 @@ function CowartSlidesMedia({ onUnhandledHtmlClick, shape, title }) {
 
       if (isCowartHtmlDraftEmbedShape(shape)) {
         const directHtmlUrl = isCowartHtmlDraftDataUrl(shape.props.url) ? shape.props.url : null
-        if (directHtmlUrl) return { kind: 'html-url', url: directHtmlUrl }
+        if (directHtmlUrl) {
+          if (!hasCowartWidgetBridge()) return { kind: 'html-url', url: directHtmlUrl }
+          const response = await window.fetch(directHtmlUrl)
+          if (!response.ok) throw new Error(`HTML 草稿加载失败：${response.status}`)
+          return {
+            kind: 'html',
+            htmlContent: await hydrateCowartHtmlDraftLocalImages(await response.text())
+          }
+        }
 
         const assetUrl =
           cowartHtmlDraftAssetUrlFromVirtualUrl(shape.meta?.cowartHtmlDraftAssetUrl) ||
@@ -3335,7 +3386,10 @@ function CowartSlidesMedia({ onUnhandledHtmlClick, shape, title }) {
         if (hasCowartWidgetBridge()) {
           const pageAsset = await readCowartPageAsset(assetUrl)
           const htmlContent = await blobFromBase64(pageAsset.dataBase64, pageAsset.mimeType).text()
-          return { kind: 'html', htmlContent }
+          return {
+            kind: 'html',
+            htmlContent: await hydrateCowartHtmlDraftLocalImages(htmlContent)
+          }
         }
 
         const response = await window.fetch(assetUrl)
